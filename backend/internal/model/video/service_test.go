@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -81,6 +83,10 @@ type fakeVideoRepo struct {
 	records []*PlayRecord // 记下写进来的播放流水,同时当观看历史的查询源
 	saveErr error
 
+	findByIDCalls  int               // FindVideoByID 被调了几次,用于断言详情缓存有没有挡住回源
+	likedByUser    map[int64][]int64 // 各用户点赞过的视频,用于测点赞状态没被缓存串号
+	listLikedCalls int
+
 	playURLCalls   int // FindVideoByPlayURL 被调了几次,用于断言缓存有没有挡住回源
 	listHistoryErr error
 }
@@ -88,6 +94,7 @@ type fakeVideoRepo struct {
 func (f *fakeVideoRepo) CreateVideo(ctx context.Context, v *Video) error { return nil }
 
 func (f *fakeVideoRepo) FindVideoByID(ctx context.Context, id int64) (*Video, error) {
+	f.findByIDCalls++
 	if v, ok := f.videos[id]; ok {
 		return v, nil
 	}
@@ -106,7 +113,17 @@ func (f *fakeVideoRepo) FindVideoByPlayURL(ctx context.Context, playURL string) 
 }
 
 func (f *fakeVideoRepo) ListLikedVideoIDs(ctx context.Context, userID int64, videoIDs []int64) ([]int64, error) {
-	return []int64{}, nil
+	f.listLikedCalls++
+	out := []int64{}
+	for _, liked := range f.likedByUser[userID] {
+		for _, want := range videoIDs {
+			if liked == want {
+				out = append(out, liked)
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // FindVideosByIDs 顺序不保证,和真实实现一致 —— 调用方必须自己按原顺序拼
@@ -188,11 +205,30 @@ func (f *fakeVideoRepo) SavePlayReport(ctx context.Context, r *PlayRecord) error
 	return nil
 }
 
+// UpdateVideoFields 真实实现按 map 逐列写库。这里也把值落到内存实体上 ——
+// 不落的话「写完再读」的用例(缓存失效就是靠它验的)会读到旧值,测不出真问题
 func (f *fakeVideoRepo) UpdateVideoFields(ctx context.Context, id int64, fields map[string]any) error {
 	if f.updateErr != nil {
 		return f.updateErr
 	}
 	f.lastFields = fields
+
+	v, ok := f.videos[id]
+	if !ok {
+		return nil
+	}
+	for col, val := range fields {
+		switch col {
+		case "title":
+			v.Title, _ = val.(string)
+		case "description":
+			v.Description, _ = val.(string)
+		case "cover_url":
+			v.CoverURL, _ = val.(string)
+		case "status":
+			v.Status, _ = val.(int8)
+		}
+	}
 	return nil
 }
 
@@ -215,6 +251,22 @@ func newTestService(v *Video) (*VideoService, *fakeVideoRepo) {
 		repo.videos[v.ID] = v
 	}
 	return NewVideoService(repo, nil, nil), repo
+}
+
+// newCachedTestService 带 Redis 的服务实例。详情缓存要真的走一遍 GET/SET ——
+// 客户端传 nil 只能测降级,测不出「缓存到底挡没挡住回源」
+func newCachedTestService(t *testing.T, v *Video) (*VideoService, *fakeVideoRepo, *miniredis.Miniredis) {
+	t.Helper()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	repo := &fakeVideoRepo{videos: map[int64]*Video{}}
+	if v != nil {
+		repo.videos[v.ID] = v
+	}
+	return NewVideoService(repo, rdb, nil), repo, mr
 }
 
 func assertCode(t *testing.T, err error, want errs.ServiceErr) {
@@ -381,6 +433,90 @@ func TestGetVideoDetail(t *testing.T) {
 		svc, _ := newTestService(draftVideo())
 		_, err := svc.GetVideoDetail(ctx, 0, 0)
 		assertCode(t, err, errs.ErrInvalidParam)
+	})
+}
+
+// TestGetVideoDetailCache 覆盖详情缓存的几条边界:命中不回源、点赞状态不串号、
+// 写操作让缓存失效、Redis 不可用时降级直查库
+func TestGetVideoDetailCache(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("第二次请求命中缓存不再回源", func(t *testing.T) {
+		svc, repo, _ := newCachedTestService(t, publishedVideo())
+
+		_, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		_, err = svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, repo.findByIDCalls, "第二次应命中缓存")
+	})
+
+	// 这是整个改动最容易写错的地方:IsLike 是 per-user 的。
+	// 缓存实体没问题,把响应一起缓存就会把上一个用户的点赞状态发给下一个
+	t.Run("点赞状态不随实体一起缓存", func(t *testing.T) {
+		svc, repo, _ := newCachedTestService(t, publishedVideo())
+		repo.likedByUser = map[int64][]int64{42: {1}}
+
+		// 没点赞的用户先把实体灌进缓存
+		other, err := svc.GetVideoDetail(ctx, 1, 99)
+		require.NoError(t, err)
+		require.NotNil(t, other.IsLike)
+		assert.False(t, *other.IsLike, "用户 99 没点过赞")
+
+		// 点过赞的用户再请求:实体来自缓存,但点赞状态必须现算
+		liked, err := svc.GetVideoDetail(ctx, 1, 42)
+		require.NoError(t, err)
+		require.NotNil(t, liked.IsLike)
+		assert.True(t, *liked.IsLike, "点赞状态被缓存串号了")
+		assert.Equal(t, 2, repo.listLikedCalls, "点赞状态应每次都查,不能跟着实体进缓存")
+	})
+
+	t.Run("编辑后缓存失效", func(t *testing.T) {
+		svc, _, _ := newCachedTestService(t, publishedVideo())
+
+		_, err := svc.GetVideoDetail(ctx, 1, 0) // 灌缓存
+		require.NoError(t, err)
+
+		_, err = svc.UpdateVideo(ctx, 1, testUserID, UpdateVideoReq{Title: "新标题"})
+		require.NoError(t, err)
+
+		resp, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, "新标题", resp.Title, "编辑后还在读旧缓存")
+	})
+
+	t.Run("发布后缓存失效", func(t *testing.T) {
+		svc, _, _ := newCachedTestService(t, draftVideo())
+
+		_, err := svc.GetVideoDetail(ctx, 1, testUserID) // 作者看草稿,把 Draft 灌进缓存
+		require.NoError(t, err)
+
+		_, err = svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err)
+
+		// 匿名能看到 —— 缓存里还留着 Draft 的话这里会 404
+		resp, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, StatusPublished, resp.Status)
+	})
+
+	// rdb 传 nil 正是 main.go 里 Redis 连不上时的形态,mustRedisClient 返回 nil
+	t.Run("Redis 不可用时降级直查库", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+
+		resp, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), resp.ID)
+	})
+
+	t.Run("Redis 报错时降级直查库", func(t *testing.T) {
+		svc, _, mr := newCachedTestService(t, publishedVideo())
+		mr.SetError("boom") // 之后所有命令都返回这个错误
+
+		resp, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), resp.ID)
 	})
 }
 

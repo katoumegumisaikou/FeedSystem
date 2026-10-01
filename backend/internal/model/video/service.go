@@ -20,6 +20,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"feed-system/internal/pkg/errs"
+	"feed-system/internal/pkg/sfcache"
 	"feed-system/internal/util/filetype"
 )
 
@@ -639,16 +640,54 @@ func (s *VideoService) videoRespForUser(ctx context.Context, userID int64, item 
 	return resp, nil
 }
 
+// videoDetailCacheTTL 详情缓存的存活时间。取 5 分钟与文件路由的可见性判定同档 ——
+// 两者缓存的都是同一份视频状态的投影,TTL 不一致只会凭空多出一个
+// 「详情页能看、文件却 404」的窗口。
+//
+// 代价:play_count 只由 TTL 兜底。播放是最热的写路径,每次上报都删缓存等于缓存失效,
+// 所以上报不失效 —— 详情页的计数最多偏小一个 TTL
+const videoDetailCacheTTL = 5 * time.Minute
+
+// videoDetailKey 详情缓存 key。前缀必须全进程唯一:sfcache 的去重域是进程级的,
+// 撞 key 会让一方拿到另一方的结果
+func videoDetailKey(videoID int64) string {
+	return "video:detail:" + strconv.FormatInt(videoID, 10)
+}
+
+// invalidateVideoDetail 清掉详情缓存。
+//
+// 删失败只记日志:缓存是加速层,删不掉最多让旧值多活一个 TTL,
+// 不该让一次已经落库成功的编辑反过来报错
+func (s *VideoService) invalidateVideoDetail(ctx context.Context, videoID int64) {
+	if s.rdb == nil {
+		return
+	}
+	if err := s.rdb.Del(ctx, videoDetailKey(videoID)).Err(); err != nil {
+		slog.ErrorContext(ctx, "删除视频详情缓存失败", "video_id", videoID, "err", err)
+	}
+}
+
 // GetVideoDetail 取视频详情(GET /videos/:id)。
 //
 // requesterID 为 0 表示匿名(软鉴权没拿到 token)。
 // 未发布的一律 404,作者本人除外 —— 用 404 而不是 403:403 等于告诉遍历者
 // 「这个 ID 存在」,草稿的 ID 边界就被探出来了
+//
+// 缓存的是 Video 实体,不是响应:VideoResp.IsLike 是 per-user 的,
+// 整份响应缓存下来会把上一个用户的点赞状态发给下一个用户。
+// 缓存只在 get 这一层 —— findVideo 同时喂着 UpdateVideo / PublishVideo 的状态守卫,
+// 那些守卫必须读精确值,陈旧状态会让「已下架不能编辑」这类规则失效
 func (s *VideoService) GetVideoDetail(ctx context.Context, videoID, requesterID int64) (*VideoResp, error) {
-	video, err := s.findVideo(ctx, videoID)
+	video, err := sfcache.Load(ctx, s.rdb, videoDetailKey(videoID), videoDetailCacheTTL,
+		func(loadCtx context.Context) (*Video, error) {
+			return s.findVideo(loadCtx, videoID)
+		})
 	if err != nil {
 		return nil, err
 	}
+
+	// 可见性判定必须在缓存之外:同一份实体,作者看得到、别人看不到。
+	// 404 也不缓存 —— 详情页不像播放器的 Range 请求那样反复打同一个死链
 	if video.Status != StatusPublished && video.AuthorID != requesterID {
 		return nil, errs.ErrNotFound.WithMsg("视频不存在")
 	}
@@ -681,6 +720,8 @@ func (s *VideoService) UpdateVideo(ctx context.Context, videoID, userID int64, r
 		slog.ErrorContext(ctx, "更新视频失败", "video_id", videoID, "user_id", userID, "err", err)
 		return nil, errs.ErrInternal.WithMsg("更新视频失败")
 	}
+	// 写成功之后才删:删早了,并发的读会把改动前的旧值重新灌回缓存
+	s.invalidateVideoDetail(ctx, videoID)
 
 	video.Title = req.Title
 	video.Description = req.Description
@@ -712,6 +753,8 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 		slog.ErrorContext(ctx, "发布视频失败", "video_id", videoID, "user_id", userID, "err", err)
 		return nil, errs.ErrInternal.WithMsg("发布视频失败")
 	}
+	// 状态变了,详情缓存里的旧状态会让匿名用户继续 404
+	s.invalidateVideoDetail(ctx, videoID)
 	video.Status = StatusPublished
 	return s.videoRespForUser(ctx, userID, video)
 }
