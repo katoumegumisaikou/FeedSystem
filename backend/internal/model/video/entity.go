@@ -39,6 +39,11 @@ type Video struct {
 	UpdatedAt time.Time      `gorm:"type:timestamp;not null" json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"type:timestamp"          json:"-"` // 软删除,不暴露前端
 
+	// PublishedAt 首次发布的时刻。草稿期为 NULL,发布时写入。
+	// 关注流按它排序 —— created_at 是「上传」时刻,长期草稿会在发布时带着一个
+	// 很旧的 created_at 进入 7 天投递窗口,被 fan-out 脚本当场裁掉
+	PublishedAt *time.Time `gorm:"type:timestamp" json:"published_at,omitempty"`
+
 	Status       int8  `gorm:"not null;default:4" json:"status"` // 状态(0 转码中 / 1 已发布 / 2 转码失败 / 3 已下架 / 4 草稿)
 	PlayCount    int64 `gorm:"not null;default:0" json:"play_count"`
 	LikesCount   int64 `gorm:"not null;default:0" json:"likes_count"`
