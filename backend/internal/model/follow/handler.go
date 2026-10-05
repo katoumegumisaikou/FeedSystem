@@ -89,3 +89,25 @@ func (h *FollowHandler) ListFollowees(c *gin.Context) {
 	}
 	response.OK(c, resp)
 }
+
+// ListFollowers 谁关注了我(GET /users/me/followers)。同样只认当前登录用户
+func (h *FollowHandler) ListFollowers(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+
+	var req ListFollowersReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("查询参数无效"))
+		return
+	}
+
+	resp, err := h.svc.ListFollowers(c.Request.Context(), userID, req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}

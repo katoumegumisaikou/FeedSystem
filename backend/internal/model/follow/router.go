@@ -39,5 +39,6 @@ func RegisterRouter(rg *gin.RouterGroup, h *FollowHandler, db *gorm.DB, rdb *red
 		priv.POST("/:id/follow", h.Follow)     // 关注
 		priv.DELETE("/:id/follow", h.Unfollow) // 取关
 		priv.GET("/me/followees", h.ListFollowees)
+		priv.GET("/me/followers", h.ListFollowers) // 谁关注了我(分页)
 	}
 }

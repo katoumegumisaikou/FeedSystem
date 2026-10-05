@@ -257,6 +257,62 @@ func (s *FollowService) replayBigVCache(ctx context.Context, authorID int64) {
 	}
 }
 
+// followerListDefaultLimit / followerListMaxLimit 粉丝列表的分页参数。
+// 关注列表能一次返回是因为它被 MaxFollowees 封顶;粉丝数没有上界,必须分页
+const (
+	followerListDefaultLimit = 50
+	followerListMaxLimit     = 100
+)
+
+// ListFollowers 谁关注了我(GET /users/me/followers)。
+//
+// 只认当前登录用户,不接受「查某个别人的粉丝」—— 路由挂了 SetSensitive,
+// 没 token 在中间件就被拦成 401,这里的 userID 兜底是纵深防御。
+//
+// 分页用 follower_id 游标而不是 OFFSET:大V 有上万粉丝,OFFSET 每页都从头数一遍,
+// 越翻越慢(与 fan-out 遍历粉丝时用的是同一条查询、同一套理由)。
+func (s *FollowService) ListFollowers(ctx context.Context, userID int64, req ListFollowersReq) (*ListFollowersResp, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = followerListDefaultLimit
+	}
+	// HTTP 绑定虽然也拦,但直连 service 的调用(测试、内部)传负数或超大值会让
+	// 「取 limit 条」失去意义,服务层自己兜住 —— 与视频流同一套口径
+	if limit < 1 || limit > followerListMaxLimit {
+		return nil, errs.ErrInvalidParam.WithMsg("每页数量无效")
+	}
+
+	var afterID int64
+	if req.Cursor != nil {
+		afterID = *req.Cursor
+	}
+
+	// 多取一条:能取到就说明后面还有,这时才给游标(与视频流同一套判据)
+	ids, err := s.repo.ListFollowerIDs(ctx, userID, afterID, limit+1)
+	if err != nil {
+		slog.ErrorContext(ctx, "查询粉丝列表失败", "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("查询粉丝列表失败")
+	}
+
+	resp := ListFollowersResp{FollowerIDs: []int64{}}
+	hasMore := len(ids) > limit
+	if hasMore {
+		ids = ids[:limit]
+	}
+	resp.FollowerIDs = append(resp.FollowerIDs, ids...)
+	// 只在确实还有下一页时给游标;游标取本页最后一条的 follower_id,
+	// 下一页用 follower_id > 游标 继续,严格前进不会重复
+	if hasMore && len(ids) > 0 {
+		last := ids[len(ids)-1]
+		resp.NextCursor = &last
+	}
+	return &resp, nil
+}
+
 // ListFollowees 取我关注的所有人(GET /users/me/followees)。
 func (s *FollowService) ListFollowees(ctx context.Context, followerID int64) (*ListFolloweesResp, error) {
 	if followerID <= 0 {
