@@ -16,6 +16,8 @@ var (
 	detailIPLimit    = redis_rate.PerMinute(120) // 详情是公开读接口,防按 ID 遍历拖库
 	historyIPLimit   = redis_rate.PerMinute(120) // 观看历史:同样是读接口,同样防遍历
 	historyUserLimit = redis_rate.PerSecond(5)   // 历史是自己的数据,按用户比按 IP 更准
+	likeIPLimit      = redis_rate.PerSecond(30)  // 点赞是高频小写,按 IP 兜底要放宽(NAT 后是好多人)
+	likeUserLimit    = redis_rate.PerSecond(10)  // 按用户精确到人,可以紧一点
 )
 
 // RegisterRouter 把 video 模块的所有路由挂到指定的路由组
@@ -36,6 +38,17 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 		pub.GET("/:id", h.GetVideoDetail)   // 视频详情
 		pub.POST("/:id/play", h.ReportPlay) // 播放上报:游客也记(user_id=0),所以放公开组
 	}
+
+	// ========== 某人的视频列表(软鉴权) ==========
+	// 路径挂在 /users 下(语义是「某人的」),但内容归视频模块管,所以在这里注册而不是
+	// account 那边。软鉴权:游客只看得到已发布,作者本人额外能看到草稿
+	//
+	// 与 account 的 GET /users/:id 不冲突:通配段名都是 :id,静态子段 videos 独立
+	userVideos := rg.Group("/users",
+		middleware.IPRateLimiter(rdb, detailIPLimit),
+		middleware.Auth(db, rdb),
+	)
+	userVideos.GET("/:id/videos", h.ListUserVideos)
 
 	// ========== 观看历史(强制登录) ==========
 	// 不能借用上面的公开组:那组是软鉴权,游客放行后 userID = 0,而 user_id = 0 是
@@ -72,5 +85,23 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 		priv.POST("/chunk/complete", h.CompleteChunkUpload) // 合并分片,生成草稿视频
 		priv.PUT("/:id", h.UpdateVideo)                     // 编辑标题 / 简介 / 封面
 		priv.POST("/:id/publish", h.PublishVideo)           // 草稿 → 已发布
+		priv.DELETE("/:id", h.DeleteVideo)                  // 软删除(幂等)
+	}
+
+	// ========== 互动(点赞,强制登录) ==========
+	// 单独一组而不并进上面的上传组:上传的阈值是按 1GiB 分片场景定的(10/s),
+	// 点赞是高频小请求,共用一个桶会让上传把点赞的额度吃光(反之亦然)。
+	//
+	// 路径 /videos/:id/like 与公开组的 /videos/:id 靠多一段静态段区分:gin 的
+	// 通配段名必须一致(都用 :id),静态子段 like/play 可以并存,不冲突
+	like := rg.Group("/videos",
+		middleware.SetSensitive(),
+		middleware.IPRateLimiter(rdb, likeIPLimit),
+		middleware.Auth(db, rdb),
+		middleware.UserRateLimiter(rdb, likeUserLimit),
+	)
+	{
+		like.POST("/:id/like", h.Like)     // 点赞(幂等)
+		like.DELETE("/:id/like", h.Unlike) // 取消点赞(幂等)
 	}
 }

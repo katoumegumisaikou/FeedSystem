@@ -221,3 +221,86 @@ func (v *VideoHandler) ListHistory(c *gin.Context) {
 	}
 	response.OK(c, resp)
 }
+
+func (v *VideoHandler) Like(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	resp, err := v.svc.LikeVideo(c.Request.Context(), videoID, userID)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+func (v *VideoHandler) Unlike(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	resp, err := v.svc.UnlikeVideo(c.Request.Context(), videoID, userID)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+func (v *VideoHandler) DeleteVideo(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	if err := v.svc.DeleteVideo(c.Request.Context(), videoID, userID); err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, nil)
+}
+
+// ListUserVideos 某人的视频列表(GET /users/:id/videos)。
+// 路径里的 :id 是作者 ID 不是视频 ID,所以不能用 videoIDParam(它的报错文案写死了「视频 ID」)
+func (v *VideoHandler) ListUserVideos(c *gin.Context) {
+	authorID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || authorID <= 0 {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("用户 ID 无效"))
+		return
+	}
+
+	var req ListUserVideosReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("查询参数无效"))
+		return
+	}
+
+	// 软鉴权:游客 UserID 为 0,只看得到已发布;作者本人额外能看到自己的草稿
+	resp, err := v.svc.ListUserVideos(c.Request.Context(), authorID, middleware.UserID(c), req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}

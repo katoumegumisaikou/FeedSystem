@@ -90,9 +90,12 @@ type fakeVideoRepo struct {
 	records []*PlayRecord // 记下写进来的播放流水,同时当观看历史的查询源
 	saveErr error
 
-	findByIDCalls  int               // FindVideoByID 被调了几次,用于断言详情缓存有没有挡住回源
-	likedByUser    map[int64][]int64 // 各用户点赞过的视频,用于测点赞状态没被缓存串号
-	listLikedCalls int
+	findByIDCalls   int               // FindVideoByID 被调了几次,用于断言详情缓存有没有挡住回源
+	likedByUser     map[int64][]int64 // 各用户点赞过的视频,用于测点赞状态没被缓存串号
+	listLikedCalls  int
+	likeErr         error // LikeVideo / UnlikeVideo 的注入错误,用于测 500 分支
+	deleteErr       error // DeleteVideo 的注入错误,用于测 500 分支
+	listByAuthorErr error // ListVideosByAuthor 的注入错误,用于测 500 分支
 
 	playURLCalls   int // FindVideoByPlayURL 被调了几次,用于断言缓存有没有挡住回源
 	listHistoryErr error
@@ -129,6 +132,110 @@ func (f *fakeVideoRepo) ListLikedVideoIDs(ctx context.Context, userID int64, vid
 				break
 			}
 		}
+	}
+	return out, nil
+}
+
+// likeCount 回读某视频当前的点赞数,不存在则为 0(与真实实现 Pluck 到零值同口径)
+func (f *fakeVideoRepo) likeCount(videoID int64) int64 {
+	if v, ok := f.videos[videoID]; ok {
+		return v.LikesCount
+	}
+	return 0
+}
+
+// LikeVideo 复刻真实实现的幂等语义:已点赞(明细已存在)时不加计数,只回读当前值。
+// 计数落在内存实体上,「点赞后详情/列表能读到新值」这类断言才成立。
+//
+// 诚实边界:内存桩单线程,复现不了真实 PG 上「唯一约束冲突」与「计数自增」的原子性;
+// 真正的并发正确性来自 repo.go 的事务 + ON CONFLICT DO NOTHING,需要真实 PostgreSQL 才能验证。
+func (f *fakeVideoRepo) LikeVideo(_ context.Context, userID, videoID int64) (int64, error) {
+	if f.likeErr != nil {
+		return 0, f.likeErr
+	}
+	if f.likedByUser == nil {
+		f.likedByUser = make(map[int64][]int64)
+	}
+	for _, id := range f.likedByUser[userID] {
+		if id == videoID {
+			return f.likeCount(videoID), nil // 已点赞:幂等,不加计数
+		}
+	}
+	f.likedByUser[userID] = append(f.likedByUser[userID], videoID)
+	if v, ok := f.videos[videoID]; ok {
+		v.LikesCount++
+	}
+	return f.likeCount(videoID), nil
+}
+
+// UnlikeVideo 复刻「只有真的删掉明细才减计数」:没点过赞时计数不动,也不会减成负数
+func (f *fakeVideoRepo) UnlikeVideo(_ context.Context, userID, videoID int64) (int64, error) {
+	if f.likeErr != nil {
+		return 0, f.likeErr
+	}
+	ids := f.likedByUser[userID]
+	kept := ids[:0]
+	removed := false
+	for _, id := range ids {
+		if id == videoID {
+			removed = true
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if removed {
+		f.likedByUser[userID] = kept
+		if v, ok := f.videos[videoID]; ok && v.LikesCount > 0 {
+			v.LikesCount--
+		}
+	}
+	return f.likeCount(videoID), nil
+}
+
+// DeleteVideo 复刻软删:从内存表摘掉,后续 FindVideoByID 就查不到了
+// (与真实实现里 GORM 自动过滤已删行同口径)。重复删除是幂等的。
+func (f *fakeVideoRepo) DeleteVideo(_ context.Context, videoID int64) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	delete(f.videos, videoID)
+	return nil
+}
+
+// ListVideosByAuthor 复刻真实实现的两种可见范围与 (created_at, id) 游标过滤,
+// 排序也与 SQL 的 ORDER BY created_at DESC, id DESC 对齐
+func (f *fakeVideoRepo) ListVideosByAuthor(_ context.Context, authorID int64, includeUnpublished bool, before time.Time, beforeID int64, limit int) ([]*Video, error) {
+	if f.listByAuthorErr != nil {
+		return nil, f.listByAuthorErr
+	}
+	var out []*Video
+	for _, v := range f.videos {
+		if v.AuthorID != authorID {
+			continue
+		}
+		if includeUnpublished {
+			if v.Status == StatusRemoved {
+				continue
+			}
+		} else if v.Status != StatusPublished {
+			continue
+		}
+		if beforeID > 0 {
+			// 严格排在 (before, beforeID) 之后才留下
+			if v.CreatedAt.After(before) || (v.CreatedAt.Equal(before) && v.ID >= beforeID) {
+				continue
+			}
+		}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }
@@ -914,4 +1021,196 @@ func TestListHistory(t *testing.T) {
 		_, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
 		assertCode(t, err, errs.ErrInternal)
 	})
+}
+
+// TestLikeVideo 点赞的关键性质是「幂等」:重复点赞不能把计数越点越大 ——
+// 客户端双击、响应丢包重试、乐观更新回滚重放都会打第二次。
+func TestLikeVideo(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+
+	t.Run("未登录 401", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		_, err := svc.LikeVideo(ctx, 1, 0)
+		assertCode(t, err, errs.ErrUnauthorized)
+	})
+
+	t.Run("视频不存在 404", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		_, err := svc.LikeVideo(ctx, 424242, testUserID)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("草稿不能点赞:对作者也 404", func(t *testing.T) {
+		svc, _ := newTestService(draftVideo())
+		_, err := svc.LikeVideo(ctx, 1, testUserID)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("首次点赞计数加一", func(t *testing.T) {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: publishedVideo()}}
+		svc := NewVideoService(repo, nil, nil)
+
+		resp, err := svc.LikeVideo(ctx, 1, other)
+		require.NoError(t, err)
+		assert.True(t, resp.IsLike)
+		assert.Equal(t, int64(1), resp.LikesCount)
+	})
+
+	t.Run("重复点赞幂等:计数不再涨", func(t *testing.T) {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: publishedVideo()}}
+		svc := NewVideoService(repo, nil, nil)
+
+		require.NoError(t, errsOrNil(svc.LikeVideo(ctx, 1, other)))
+		resp, err := svc.LikeVideo(ctx, 1, other)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), resp.LikesCount, "第二次点赞不该再加计数")
+	})
+
+	t.Run("仓储出错返回 500", func(t *testing.T) {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: publishedVideo()}}
+		repo.likeErr = errors.New("boom")
+		svc := NewVideoService(repo, nil, nil)
+
+		_, err := svc.LikeVideo(ctx, 1, other)
+		assertCode(t, err, errs.ErrInternal)
+	})
+}
+
+// TestUnlikeVideo 取消点赞同样幂等,且计数不能被减成负数
+func TestUnlikeVideo(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+
+	t.Run("没点过赞也能取消:计数保持 0 不为负", func(t *testing.T) {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: publishedVideo()}}
+		svc := NewVideoService(repo, nil, nil)
+
+		resp, err := svc.UnlikeVideo(ctx, 1, other)
+		require.NoError(t, err)
+		assert.False(t, resp.IsLike)
+		assert.Equal(t, int64(0), resp.LikesCount, "没点过赞时不该把计数减成负")
+	})
+
+	t.Run("点赞后取消:计数回落", func(t *testing.T) {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: publishedVideo()}}
+		svc := NewVideoService(repo, nil, nil)
+
+		_, err := svc.LikeVideo(ctx, 1, other)
+		require.NoError(t, err)
+		resp, err := svc.UnlikeVideo(ctx, 1, other)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), resp.LikesCount)
+	})
+}
+
+// TestDeleteVideo 软删 + 归属守卫 + 幂等
+func TestDeleteVideo(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+
+	t.Run("不是作者 403", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		err := svc.DeleteVideo(ctx, 1, other)
+		assertCode(t, err, errs.ErrForbidden)
+	})
+
+	t.Run("未登录 401", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		err := svc.DeleteVideo(ctx, 1, 0)
+		assertCode(t, err, errs.ErrUnauthorized)
+	})
+
+	t.Run("作者删除后查不到(软删生效)", func(t *testing.T) {
+		svc, repo := newTestService(publishedVideo())
+
+		require.NoError(t, svc.DeleteVideo(ctx, 1, testUserID))
+		assert.NotContains(t, repo.videos, 1, "删除后不该还在表里")
+
+		_, err := svc.GetVideoDetail(ctx, 1, testUserID)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("重复删除幂等", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		require.NoError(t, svc.DeleteVideo(ctx, 1, testUserID))
+		assert.NoError(t, svc.DeleteVideo(ctx, 1, testUserID), "再删一次不该报错")
+	})
+
+	t.Run("仓储出错返回 500", func(t *testing.T) {
+		svc, repo := newTestService(publishedVideo())
+		repo.deleteErr = errors.New("boom")
+		assertCode(t, svc.DeleteVideo(ctx, 1, testUserID), errs.ErrInternal)
+	})
+}
+
+// TestListUserVideos 一个接口两种可见范围:别人只看已发布,作者看自己还含草稿
+func TestListUserVideos(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+
+	// 作者 7 名下:一条草稿(1)+ 一条已发布(2)+ 一条已下架(3)
+	newRepo := func() *fakeVideoRepo {
+		draft := draftVideo()
+		draft.CreatedAt = time.Now().Add(-2 * time.Hour)
+		pub := publishedVideo()
+		pub.ID, pub.CreatedAt = 2, time.Now().Add(-time.Hour)
+		removed := publishedVideo()
+		removed.ID, removed.Status, removed.CreatedAt = 3, StatusRemoved, time.Now()
+		return &fakeVideoRepo{videos: map[int64]*Video{1: draft, 2: pub, 3: removed}}
+	}
+
+	t.Run("别人只看得到已发布", func(t *testing.T) {
+		svc := NewVideoService(newRepo(), nil, nil)
+		resp, err := svc.ListUserVideos(ctx, testUserID, other, ListUserVideosReq{})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2}, videoIDsOf(resp.Items), "草稿与已下架都不该外露")
+	})
+
+	t.Run("作者看自己含草稿,但仍不含已下架", func(t *testing.T) {
+		svc := NewVideoService(newRepo(), nil, nil)
+		resp, err := svc.ListUserVideos(ctx, testUserID, testUserID, ListUserVideosReq{})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2, 1}, videoIDsOf(resp.Items), "应含草稿、不含已下架,按上传时间倒序")
+	})
+
+	t.Run("游客(0)走公开口径", func(t *testing.T) {
+		svc := NewVideoService(newRepo(), nil, nil)
+		resp, err := svc.ListUserVideos(ctx, testUserID, 0, ListUserVideosReq{})
+		require.NoError(t, err)
+		assert.Equal(t, []int64{2}, videoIDsOf(resp.Items))
+	})
+
+	t.Run("空列表返回空切片而不是 nil", func(t *testing.T) {
+		svc := NewVideoService(&fakeVideoRepo{videos: map[int64]*Video{}}, nil, nil)
+		resp, err := svc.ListUserVideos(ctx, testUserID, other, ListUserVideosReq{})
+		require.NoError(t, err)
+		assert.NotNil(t, resp.Items)
+		assert.Empty(t, resp.Items)
+		assert.Nil(t, resp.NextCursor)
+	})
+
+	t.Run("作者 ID 无效 400", func(t *testing.T) {
+		svc := NewVideoService(newRepo(), nil, nil)
+		_, err := svc.ListUserVideos(ctx, 0, other, ListUserVideosReq{})
+		assertCode(t, err, errs.ErrInvalidParam)
+	})
+
+	t.Run("limit 越界 400", func(t *testing.T) {
+		svc := NewVideoService(newRepo(), nil, nil)
+		_, err := svc.ListUserVideos(ctx, testUserID, other, ListUserVideosReq{Limit: 999})
+		assertCode(t, err, errs.ErrInvalidParam)
+	})
+}
+
+// errsOrNil 把 (resp, err) 抹成单值 err,便于在 require 里做前置校验
+func errsOrNil[T any](_ T, err error) error { return err }
+
+// videoIDsOf 取一批卡片的 ID,断言用
+func videoIDsOf(items []VideoResp) []int64 {
+	ids := make([]int64, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.ID)
+	}
+	return ids
 }

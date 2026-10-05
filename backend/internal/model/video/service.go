@@ -762,6 +762,199 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 	return s.videoRespForUser(ctx, userID, video)
 }
 
+// loadLikableVideo 取「可以被点赞」的视频:必须已发布。
+//
+// 未发布(草稿 / 转码中 / 已下架)一律 404,与详情接口对非作者的口径一致 ——
+// 用 404 而不是 403,避免把「ID 不存在」和「是别人的草稿」区分开、被拿来探测 ID 边界。
+//
+// 作者本人也不放行:给还没发布的东西点赞没有意义,likes_count 是给已发布内容看的。
+func (s *VideoService) loadLikableVideo(ctx context.Context, videoID, userID int64) (*Video, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+	video, err := s.findVideo(ctx, videoID)
+	if err != nil {
+		return nil, err
+	}
+	if video.Status != StatusPublished {
+		return nil, errs.ErrNotFound.WithMsg("视频不存在")
+	}
+	return video, nil
+}
+
+// LikeVideo 点赞(POST /videos/:id/like)。
+//
+// 幂等:重复点赞返回成功与同一份结果,而不是 409 —— 客户端重试(响应丢包、
+// 双击、乐观更新回滚重放)都会走到这,报错只会让用户以为没点上。
+//
+// 计数由仓储在事务里自增,这里不自己算「旧值 + 1」:那样在两个请求同时到达时
+// 会各写一份同样的值,丢掉一次。
+func (s *VideoService) LikeVideo(ctx context.Context, videoID, userID int64) (*LikeResp, error) {
+	if _, err := s.loadLikableVideo(ctx, videoID, userID); err != nil {
+		return nil, err
+	}
+
+	count, err := s.videorepo.LikeVideo(ctx, userID, videoID)
+	if err != nil {
+		slog.ErrorContext(ctx, "点赞失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("点赞失败")
+	}
+
+	// 详情缓存里存的是 Video 实体,likes_count 不失效就会显示旧数字。
+	// 点赞远不如播放热,删缓存的代价比「等 TTL 兜底」小得多,所以这里主动失效
+	s.invalidateVideoDetail(ctx, videoID)
+	return &LikeResp{IsLike: true, LikesCount: count}, nil
+}
+
+// UnlikeVideo 取消点赞(DELETE /videos/:id/like)。同样幂等:没点过赞也返回成功。
+func (s *VideoService) UnlikeVideo(ctx context.Context, videoID, userID int64) (*LikeResp, error) {
+	if _, err := s.loadLikableVideo(ctx, videoID, userID); err != nil {
+		return nil, err
+	}
+
+	count, err := s.videorepo.UnlikeVideo(ctx, userID, videoID)
+	if err != nil {
+		slog.ErrorContext(ctx, "取消点赞失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("取消点赞失败")
+	}
+
+	s.invalidateVideoDetail(ctx, videoID)
+	return &LikeResp{IsLike: false, LikesCount: count}, nil
+}
+
+// DeleteVideo 删除视频(DELETE /videos/:id)。
+//
+// 任何状态都可删(草稿 / 已发布 / 已下架)—— 删除是作者对自己内容的处置权,
+// 不像编辑那样要限「已下架不能改」。
+//
+// 幂等:已删除(或从未存在)一律按成功返回。客户端重试、双击、乐观更新重放都会走到这,
+// 报 404 只会让用户看到一个「视频不存在」的假错误 —— 与 PublishVideo「重复发布当成功」
+// 同一套理由。
+//
+// 因此这里不用 loadOwnedVideo:它要求视频必须存在,而「已删除」在 GORM 的软删过滤下
+// 同样表现为「查不到」—— 两者都无事可做,不该区别对待。
+//
+// 已知残留(有意不处理,记在这里):最新流缓存 feed:video:latest 存的是完整卡片 JSON,
+// 被删视频的那张卡片最多残留一个 latestVideosTTL(1 小时)。期间它会出现在最新流列表里,
+// 但点开是 404 —— 详情与文件路由都回 DB,软删过滤在那里生效。
+// 关注流不受影响:那边只存 video_id,回表时被软删过滤挡掉。
+// 要彻底清掉它需要 feed 暴露一个失效钩子,涉及跨模块接缝,不在本次改动范围内。
+func (s *VideoService) DeleteVideo(ctx context.Context, videoID, userID int64) error {
+	if userID <= 0 {
+		return errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+	if videoID <= 0 {
+		return errs.ErrInvalidParam.WithMsg("视频 ID 无效")
+	}
+
+	video, err := s.videorepo.FindVideoByID(ctx, videoID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			// 已删除 / 从未存在:没有可删的东西,按成功返回(见函数头「幂等」)
+			return nil
+		}
+		slog.ErrorContext(ctx, "查询视频失败", "video_id", videoID, "user_id", userID, "err", err)
+		return errs.ErrInternal.WithMsg("删除视频失败")
+	}
+	if video.AuthorID != userID {
+		return errs.ErrForbidden.WithMsg("无权操作该视频")
+	}
+
+	if err := s.videorepo.DeleteVideo(ctx, videoID); err != nil {
+		slog.ErrorContext(ctx, "删除视频失败", "video_id", videoID, "user_id", userID, "err", err)
+		return errs.ErrInternal.WithMsg("删除视频失败")
+	}
+	// 详情缓存里还留着这条实体,而软删过滤在 findVideo 里、缓存挡在它前面 ——
+	// 不删缓存会让已删除的视频继续可读
+	s.invalidateVideoDetail(ctx, videoID)
+	return nil
+}
+
+// userVideosDefaultLimit / userVideosMaxLimit 某人视频列表的分页参数
+const (
+	userVideosDefaultLimit = 30
+	userVideosMaxLimit     = 100
+)
+
+// ListUserVideos 某人的视频列表(GET /users/:id/videos)。
+//
+// 一个接口承担两种用法:别人看作者的公开主页(只有已发布),作者看自己的作品管理页
+// (额外含草稿 / 转码中 / 转码失败)。可见范围与 visibleTo 同一口径 ——
+// 已下架对谁都不可见,那是运营决定而不是归属问题。
+//
+// 分页用 (created_at, id) 复合游标:与观看历史同一条理由 —— 只比时间的话,
+// 同一微秒上传的两条没有确定顺序,边界会漏条或重复。
+func (s *VideoService) ListUserVideos(ctx context.Context, authorID, requesterID int64, req ListUserVideosReq) (*ListUserVideosResp, error) {
+	if authorID <= 0 {
+		return nil, errs.ErrInvalidParam.WithMsg("用户 ID 无效")
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = userVideosDefaultLimit
+	}
+	if limit < 1 || limit > userVideosMaxLimit {
+		return nil, errs.ErrInvalidParam.WithMsg("每页数量无效")
+	}
+
+	// 游标要么都给要么都不给:只给一个说明边界不完整,当首页处理(与视频流同一口径)
+	var (
+		before   time.Time
+		beforeID int64
+	)
+	switch {
+	case req.CursorCreatedAt == nil && req.CursorVideoID == nil:
+		// 首页,不设边界
+	case req.CursorCreatedAt == nil || req.CursorVideoID == nil:
+		return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+	default:
+		if *req.CursorVideoID <= 0 {
+			return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+		}
+		before = time.UnixMicro(*req.CursorCreatedAt)
+		beforeID = *req.CursorVideoID
+	}
+
+	// 作者看自己才放行未发布内容。requesterID 为 0 表示游客(软鉴权没拿到 token),走公开口径
+	includeUnpublished := requesterID > 0 && requesterID == authorID
+
+	// 多取一条用来判「还有没有下一页」
+	videos, err := s.videorepo.ListVideosByAuthor(ctx, authorID, includeUnpublished, before, beforeID, limit+1)
+	if err != nil {
+		slog.ErrorContext(ctx, "查询用户视频列表失败", "author_id", authorID, "requester_id", requesterID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("查询用户视频列表失败")
+	}
+
+	hasMore := len(videos) > limit
+	if hasMore {
+		videos = videos[:limit]
+	}
+
+	cards := make([]*VideoResp, 0, len(videos))
+	for _, v := range videos {
+		cards = append(cards, toVideoResp(v))
+	}
+
+	// 点赞态是装饰字段:查询失败只降级(不填 IsLike),不让整个列表跟着 500。
+	// 详情那几个接口目前仍是「失败即 500」的旧口径,这里按列表接口的惯例自行降级,
+	// 与 feed 模块的视频流保持一致
+	if err := s.setLikeStatuses(ctx, requesterID, cards); err != nil {
+		slog.WarnContext(ctx, "点赞状态查询失败,本页不填点赞态(列表照常返回)",
+			"user_id", requesterID, "video_count", len(cards))
+	}
+
+	resp := ListUserVideosResp{Items: make([]VideoResp, 0, len(cards))}
+	for _, card := range cards {
+		resp.Items = append(resp.Items, *card)
+	}
+	// 只在确实还有下一页时给游标;游标取本页最后一条,下一页用严格小于它继续
+	if hasMore && len(videos) > 0 {
+		last := videos[len(videos)-1]
+		resp.NextCursor = &UserVideoCursor{CreatedAt: last.CreatedAt.UnixMicro(), VideoID: last.ID}
+	}
+	return &resp, nil
+}
+
 // visibleTo 视频对 requesterID 是否可见,requesterID 为 0 表示游客(软鉴权没拿到 token)。
 //
 // 已下架对所有人不可见 —— 含作者本人;草稿 / 转码中 / 转码失败只对作者可见。

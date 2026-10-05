@@ -46,6 +46,19 @@ type VideoRepository interface {
 	// FindVideosByIDs 按主键批量查,顺序不保证。用来把历史记录拼成视频卡片,避免 N+1
 	FindVideosByIDs(ctx context.Context, ids []int64) ([]*Video, error)
 
+	// ListVideosByAuthor 取某作者一页视频,按 (created_at, id) 倒序。
+	//
+	// includeUnpublished 决定可见范围,与 visibleTo 同一口径:
+	//   - false(别人看):只返回已发布 —— 草稿 / 转码中 / 转码失败都不该外露
+	//   - true(作者看自己):返回除「已下架」外的全部,作者要能列出自己的草稿去编辑或发布
+	//
+	// 已下架对所有人都不可见(含作者本人),与 visibleTo 一致 —— 那是运营决定,不是归属问题。
+	// 软删过滤由 GORM 按 Video 里嵌的 gorm.DeletedAt 自动补上。
+	//
+	// 游标是复合的 (created_at, id):只比 created_at 的话,同一微秒上传的两条没有确定
+	// 顺序,翻页会漏条或重复。用行值比较 (created_at, id) < (?, ?) 一次表达,边界无缝
+	ListVideosByAuthor(ctx context.Context, authorID int64, includeUnpublished bool, before time.Time, beforeID int64, limit int) ([]*Video, error)
+
 	// SavePlayReport 在一个事务里追加一条播放流水,并把 videos.play_count 加一。
 	// 两件事必须同生共死:流水是明细、play_count 是读列表直接用的聚合,
 	// 只成一件就会出现「有明细没计数」这种对不上的漂移
@@ -65,6 +78,30 @@ type VideoRepository interface {
 	//
 	// 任务靠 UNIQUE (video_id, task_type) 幂等 —— 重复发布不会产生第二条同类型任务。
 	MarkPublished(ctx context.Context, videoID, authorID int64) error
+
+	// LikeVideo 点赞,返回点赞后的总数。幂等:重复点赞不报错、也不重复加计数。
+	//
+	// 明细(video_likes)与计数(videos.likes_count)必须在一个事务里同生共死 ——
+	// 只成一件就会留下「有明细没计数」或反过来的漂移,而 likes_count 是读列表直接用的聚合,
+	// 没有自愈途径。与 SavePlayReport 同一套口径。
+	//
+	// 「有没有真的插入」由 UNIQUE (user_id, video_id) + ON CONFLICT DO NOTHING 判定:
+	// 受影响 0 行说明早就点过赞了,此时再加就会把计数越点越大。
+	LikeVideo(ctx context.Context, userID, videoID int64) (int64, error)
+
+	// UnlikeVideo 取消点赞,返回取消后的总数。幂等:没点过赞也不报错。
+	// 只有真的删掉了明细行才减计数,并用 GREATEST 兜底防止计数被减成负数
+	// (历史漂移 + 并发取消都可能让「减」比「加」多一次)。
+	UnlikeVideo(ctx context.Context, userID, videoID int64) (int64, error)
+
+	// DeleteVideo 软删除视频。
+	//
+	// 软删而不是物理删:play_records / video_likes / fanout_tasks 都可能引用这个 ID,
+	// 物理删会留下悬空引用;而 Video 自带 gorm.DeletedAt,软删后所有走 GORM 的查询
+	// 自动带上 deleted_at IS NULL,读路径不必逐个改。
+	//
+	// 幂等:重复删除影响 0 行且不报错(软删第二次会因为没有 deleted_at IS NULL 的行而空转)。
+	DeleteVideo(ctx context.Context, videoID int64) error
 
 	// UpdateVideoFields 只更新传入的列,updated_at 由 GORM 自动填。
 	// 用 map 而不是 struct:struct 更新会跳过零值,把 Description 清空成 "" 就写不进库
@@ -198,6 +235,34 @@ func (r *videoRepository) FindVideosByIDs(ctx context.Context, ids []int64) ([]*
 	return videos, nil
 }
 
+// ListVideosByAuthor 见接口注释。两种可见范围只差一个 status 条件,所以共用一条查询
+// (同一个方法而不是拆两个:游标与排序只有一份,拆开会多出一份要同步维护的边界逻辑)
+func (r *videoRepository) ListVideosByAuthor(ctx context.Context, authorID int64, includeUnpublished bool, before time.Time, beforeID int64, limit int) ([]*Video, error) {
+	query := r.db.WithContext(ctx).Model(&Video{}).Where("author_id = ?", authorID)
+	if includeUnpublished {
+		query = query.Where("status <> ?", StatusRemoved)
+	} else {
+		query = query.Where("status = ?", StatusPublished)
+	}
+	// 行值比较:同一时刻上传的视频靠 id 决出先后,边界才没有缝。
+	// beforeID 为 0 表示首页,不加边界
+	if beforeID > 0 {
+		query = query.Where("(created_at, id) < (?, ?)", before, beforeID)
+	}
+
+	var videos []*Video
+	// 软删过滤由 GORM 自动补(Video 里嵌了 gorm.DeletedAt)
+	err := query.
+		Order("created_at DESC").
+		Order("id DESC").
+		Limit(limit).
+		Find(&videos).Error
+	if err != nil {
+		return nil, err
+	}
+	return videos, nil
+}
+
 // SavePlayReport 流水与计数必须一起成功,所以包一个事务:
 // 分开写会在中间失败时留下「有明细没计数」的漂移,而 play_count 没有自愈途径
 func (r *videoRepository) SavePlayReport(ctx context.Context, rec *PlayRecord) error {
@@ -255,4 +320,66 @@ func (r *videoRepository) MarkPublished(ctx context.Context, videoID, authorID i
 
 func (r *videoRepository) UpdateVideoFields(ctx context.Context, id int64, fields map[string]any) error {
 	return r.db.WithContext(ctx).Model(&Video{}).Where("id = ?", id).Updates(fields).Error
+}
+
+// DeleteVideo 软删除。Video 里嵌了 gorm.DeletedAt,GORM 会把 Delete 自动改写成
+// UPDATE videos SET deleted_at = now(),而不是真的 DELETE 掉那一行。
+func (r *videoRepository) DeleteVideo(ctx context.Context, videoID int64) error {
+	return r.db.WithContext(ctx).Delete(&Video{}, videoID).Error
+}
+
+// LikeVideo 点赞。明细与计数同事务,幂等靠 UNIQUE (user_id, video_id)。
+//
+// 视频是否存在由服务层先校验(findVideo),所以这里不再查一次 —— 事务里只做两件写入。
+// 若视频确实不存在,CREATE 仍会成功(video_likes 没有外键),但随后的计数更新影响 0 行、
+// 读回来是 0,不会造成数据损坏。
+func (r *videoRepository) LikeVideo(ctx context.Context, userID, videoID int64) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Clauses(clause.OnConflict{DoNothing: true}).
+			Create(&VideoLike{UserID: userID, VideoID: videoID})
+		if res.Error != nil {
+			return res.Error
+		}
+		// 只有真的插入了明细才加计数:重复点赞被唯一约束挡下(0 行),
+		// 此时再加就会把 likes_count 越点越大
+		if res.RowsAffected > 0 {
+			if err := tx.Model(&Video{}).
+				Where("id = ?", videoID).
+				// UpdateColumn 而非 Update:点赞数变了不等于内容被改动,不该顶掉 updated_at
+				UpdateColumn("likes_count", gorm.Expr("likes_count + 1")).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&Video{}).Where("id = ?", videoID).Pluck("likes_count", &count).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// UnlikeVideo 取消点赞。只有真的删掉明细行才减计数,并以 GREATEST 兜底。
+func (r *videoRepository) UnlikeVideo(ctx context.Context, userID, videoID int64) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("user_id = ? AND video_id = ?", userID, videoID).Delete(&VideoLike{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected > 0 {
+			// GREATEST(...,0):计数一旦因历史漂移偏小,并发取消就会把它减成负数;
+			// 显示成负的点赞数比少算一次更糟,这里直接用 SQL 夹住下界
+			if err := tx.Model(&Video{}).
+				Where("id = ?", videoID).
+				UpdateColumn("likes_count", gorm.Expr("GREATEST(likes_count - 1, 0)")).Error; err != nil {
+				return err
+			}
+		}
+		return tx.Model(&Video{}).Where("id = ?", videoID).Pluck("likes_count", &count).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }

@@ -45,6 +45,47 @@ type VideoResp struct {
 	IsLike       *bool     `json:"is_like,omitempty"` // nil 表示匿名或未计算
 }
 
+// LikeResp 点赞 / 取消点赞的结果。
+//
+// 两个字段都返回是因为点赞是个「开关」动作:前端做乐观更新时会先翻转图标,
+// 拿到响应后要用服务端的真值纠正 —— 只回 bool 的话,并发点赞导致的计数变化就反映不出来。
+// LikesCount 是事务内读到的最新值,而不是「旧值 ± 1」的估算
+type LikeResp struct {
+	IsLike     bool  `json:"is_like"`     // 操作后是否处于已点赞状态
+	LikesCount int64 `json:"likes_count"` // 操作后的点赞总数
+}
+
+// ListUserVideosReq 某人的视频列表查询参数(GET /users/:id/videos)。
+//
+// 游标是复合的 (created_at, video_id)。只带时间戳的话,同一微秒上传的两条没有
+// 确定顺序,翻页会漏条或重复;带上 video_id 兜底,边界就从「某个时刻」变成
+// 「某条记录之前」。时间用微秒,与 videos.created_at(TIMESTAMP 微秒)齐平 ——
+// 必须能精确还原库里的值,否则 video_id 那个兜底条件的等号永远不成立,等于没加
+type ListUserVideosReq struct {
+	// Limit 每页条数。0 由 service 补默认值;max=100 卡住「一次拉全表」
+	Limit int `form:"limit" binding:"omitempty,min=1,max=100"`
+	// CursorCreatedAt 上一页最后一条的 created_at(Unix 微秒)。首页不传
+	CursorCreatedAt *int64 `form:"cursor_created_at" binding:"omitempty,min=0"`
+	// CursorVideoID 上一页最后一条的视频 ID。首页不传;必须和 CursorCreatedAt 同时给
+	CursorVideoID *int64 `form:"cursor_video_id" binding:"omitempty,min=1"`
+}
+
+// UserVideoCursor 某人视频列表的下一页游标。
+//
+// 两个字段必须一起带回来:只带 created_at 的话,同一微秒上传的两条会漏或重复
+type UserVideoCursor struct {
+	CreatedAt int64 `json:"created_at"` // Unix 微秒
+	VideoID   int64 `json:"video_id"`
+}
+
+// ListUserVideosResp 某人一页视频。和最新流一样不带 has_more:next_cursor 为 null 即到底
+type ListUserVideosResp struct {
+	// Items 视频卡片,按上传时间倒序。service 保证非 nil(空页返回 [] 而不是 null)
+	Items []VideoResp `json:"items"`
+	// NextCursor 只在确实还有下一页时才给;到底了是 null
+	NextCursor *UserVideoCursor `json:"next_cursor,omitempty"`
+}
+
 // ListHistoryReq 观看历史查询参数(GET /videos/history)。
 //
 // 游标是复合的 (watched_at, video_id):只带时间戳的话,同一时刻的两条没有确定顺序,
