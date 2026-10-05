@@ -93,6 +93,7 @@ type fakeVideoRepo struct {
 	findByIDCalls   int               // FindVideoByID 被调了几次,用于断言详情缓存有没有挡住回源
 	likedByUser     map[int64][]int64 // 各用户点赞过的视频,用于测点赞状态没被缓存串号
 	listLikedCalls  int
+	listLikedErr    error // ListLikedVideoIDs 的注入错误,用于测「点赞态查不到」的降级
 	likeErr         error // LikeVideo / UnlikeVideo 的注入错误,用于测 500 分支
 	deleteErr       error // DeleteVideo 的注入错误,用于测 500 分支
 	listByAuthorErr error // ListVideosByAuthor 的注入错误,用于测 500 分支
@@ -124,6 +125,9 @@ func (f *fakeVideoRepo) FindVideoByPlayURL(ctx context.Context, playURL string) 
 
 func (f *fakeVideoRepo) ListLikedVideoIDs(ctx context.Context, userID int64, videoIDs []int64) ([]int64, error) {
 	f.listLikedCalls++
+	if f.listLikedErr != nil {
+		return nil, f.listLikedErr
+	}
 	out := []int64{}
 	for _, liked := range f.likedByUser[userID] {
 		for _, want := range videoIDs {
@@ -1141,6 +1145,77 @@ func TestDeleteVideo(t *testing.T) {
 		svc, repo := newTestService(publishedVideo())
 		repo.deleteErr = errors.New("boom")
 		assertCode(t, svc.DeleteVideo(ctx, 1, testUserID), errs.ErrInternal)
+	})
+}
+
+// TestSetLikeStatusesDegrades 点赞态是装饰字段:它查不到不该让整个请求失败。
+//
+// 写路径尤其要紧 —— UpdateVideo / PublishVideo 都是「先落库、再拼响应」,
+// 到拼响应这一步时数据已经改完、缓存也已经清掉。此时报 500 会让用户以为操作没生效
+// 并去重试,而实际是成功的:界面状态与实际状态不一致,最难排查。
+func TestSetLikeStatusesDegrades(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+
+	newFailedLikesRepo := func(v *Video) *fakeVideoRepo {
+		return &fakeVideoRepo{
+			videos:       map[int64]*Video{v.ID: v},
+			listLikedErr: errors.New("点赞查询炸了"),
+		}
+	}
+
+	t.Run("详情:点赞态查不到仍返回视频,IsLike 为 nil", func(t *testing.T) {
+		svc := NewVideoService(newFailedLikesRepo(publishedVideo()), nil, nil)
+
+		resp, err := svc.GetVideoDetail(ctx, 1, other)
+		require.NoError(t, err, "点赞态查询失败不该让详情 500")
+		assert.Equal(t, int64(1), resp.ID, "视频内容应照常返回")
+		assert.Nil(t, resp.IsLike, "未算出点赞态,IsLike 应为 nil(DTO 允许「未计算」)")
+	})
+
+	t.Run("编辑:点赞态查不到仍报成功,且列真的写进了库", func(t *testing.T) {
+		repo := newFailedLikesRepo(publishedVideo())
+		svc := NewVideoService(repo, nil, nil)
+
+		resp, err := svc.UpdateVideo(ctx, 1, testUserID, UpdateVideoReq{Title: "新标题"})
+		require.NoError(t, err, "编辑成功之后不该因为点赞态查不到而报 500")
+		assert.Equal(t, "新标题", resp.Title)
+		assert.Equal(t, "新标题", repo.videos[1].Title, "标题必须真的落库")
+		assert.Nil(t, resp.IsLike)
+	})
+
+	t.Run("发布:点赞态查不到仍报成功,状态也确实翻了", func(t *testing.T) {
+		repo := newFailedLikesRepo(draftVideo())
+		svc := NewVideoService(repo, nil, nil)
+
+		resp, err := svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err, "发布成功之后不该因为点赞态查不到而报 500")
+		assert.Equal(t, StatusPublished, resp.Status)
+		assert.Equal(t, StatusPublished, repo.videos[1].Status, "状态必须真的翻过来")
+		assert.Nil(t, resp.IsLike)
+	})
+
+	t.Run("某人视频列表:点赞态查不到仍返回列表", func(t *testing.T) {
+		svc := NewVideoService(newFailedLikesRepo(publishedVideo()), nil, nil)
+
+		resp, err := svc.ListUserVideos(ctx, testUserID, other, ListUserVideosReq{})
+		require.NoError(t, err)
+		require.Len(t, resp.Items, 1)
+		assert.Nil(t, resp.Items[0].IsLike)
+	})
+
+	t.Run("查询正常时点赞态照常填上", func(t *testing.T) {
+		// 对照组:降级只该发生在失败路径,正常路径不能因为改动而变成「永不填」
+		repo := &fakeVideoRepo{
+			videos:      map[int64]*Video{1: publishedVideo()},
+			likedByUser: map[int64][]int64{other: {1}},
+		}
+		svc := NewVideoService(repo, nil, nil)
+
+		resp, err := svc.GetVideoDetail(ctx, 1, other)
+		require.NoError(t, err)
+		require.NotNil(t, resp.IsLike, "查询成功时必须填上点赞态")
+		assert.True(t, *resp.IsLike)
 	})
 }
 

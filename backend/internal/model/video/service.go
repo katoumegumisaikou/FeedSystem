@@ -607,9 +607,22 @@ func (s *VideoService) GetUserLikeStatuses(ctx context.Context, userID int64, vi
 	return statuses, nil
 }
 
-func (s *VideoService) setLikeStatuses(ctx context.Context, userID int64, items []*VideoResp) error {
+// setLikeStatuses 把当前用户的点赞态填进 items(原地改)。失败只降级,不阻断调用方。
+//
+// 刻意不返回 error:点赞态只是卡片上的一个装饰字段,缺失时 IsLike 保持 nil ——
+// 这是 DTO 明确允许的状态(见 VideoResp.IsLike 注释「未计算」)。若为它让整个请求
+// 返回 500,就是一个装饰字段拖垮了主功能,代价与收益完全不成比例。
+//
+// 这一点在写路径上尤其要紧:UpdateVideo / PublishVideo 都是「先落库、再拼响应」,
+// 到这里时数据库已经改完、缓存也已经清掉。此时因为一次点赞查询失败而报 500,
+// 用户会以为操作没生效并去重试 —— 界面状态与实际状态不一致,是最难排查的一类问题。
+//
+// 与 feed 模块的 setLikeStatuses 口径一致(那边同样是失败只记日志)。
+// GetUserLikeStatuses 仍保留 error 返回值:它是给 feed 用的接口契约,
+// 由调用方自己决定降级,这里只是其中一个调用方。
+func (s *VideoService) setLikeStatuses(ctx context.Context, userID int64, items []*VideoResp) {
 	if userID <= 0 || len(items) == 0 {
-		return nil
+		return
 	}
 
 	videoIDs := make([]int64, 0, len(items))
@@ -620,7 +633,10 @@ func (s *VideoService) setLikeStatuses(ctx context.Context, userID int64, items 
 	}
 	statuses, err := s.GetUserLikeStatuses(ctx, userID, videoIDs)
 	if err != nil {
-		return err
+		// 底层错误已由 GetUserLikeStatuses / 仓储记录;这里补记降级影响,并继续返回
+		slog.WarnContext(ctx, "点赞状态查询失败,本次不填点赞态(响应照常返回)",
+			"user_id", userID, "video_count", len(videoIDs))
+		return
 	}
 	for _, item := range items {
 		if item == nil {
@@ -629,14 +645,13 @@ func (s *VideoService) setLikeStatuses(ctx context.Context, userID int64, items 
 		liked := statuses[item.ID]
 		item.IsLike = &liked
 	}
-	return nil
 }
 
+// videoRespForUser 拼一份带点赞态的响应。setLikeStatuses 已不返回错误,
+// 所以这里也不再可能因为「点赞态查不到」而失败 —— 剩下的失败只来自拼接本身
 func (s *VideoService) videoRespForUser(ctx context.Context, userID int64, item *Video) (*VideoResp, error) {
 	resp := toVideoResp(item)
-	if err := s.setLikeStatuses(ctx, userID, []*VideoResp{resp}); err != nil {
-		return nil, err
-	}
+	s.setLikeStatuses(ctx, userID, []*VideoResp{resp})
 	return resp, nil
 }
 
@@ -935,13 +950,8 @@ func (s *VideoService) ListUserVideos(ctx context.Context, authorID, requesterID
 		cards = append(cards, toVideoResp(v))
 	}
 
-	// 点赞态是装饰字段:查询失败只降级(不填 IsLike),不让整个列表跟着 500。
-	// 详情那几个接口目前仍是「失败即 500」的旧口径,这里按列表接口的惯例自行降级,
-	// 与 feed 模块的视频流保持一致
-	if err := s.setLikeStatuses(ctx, requesterID, cards); err != nil {
-		slog.WarnContext(ctx, "点赞状态查询失败,本页不填点赞态(列表照常返回)",
-			"user_id", requesterID, "video_count", len(cards))
-	}
+	// 点赞态是装饰字段:setLikeStatuses 失败只降级(不填 IsLike),不会让列表跟着 500
+	s.setLikeStatuses(ctx, requesterID, cards)
 
 	resp := ListUserVideosResp{Items: make([]VideoResp, 0, len(cards))}
 	for _, card := range cards {
