@@ -47,6 +47,44 @@ func (r *pagedFeedRepo) ListVideosByLikes(context.Context, int64, int64, int) ([
 	return nil, nil
 }
 
+// ListVideosByIDs 按 ID 过滤,顺序不保证 —— 和真实实现一致,调用方自己按原顺序拼
+func (r *pagedFeedRepo) ListVideosByIDs(_ context.Context, ids []int64) ([]*video.Video, error) {
+	want := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []*video.Video
+	for _, v := range r.videos {
+		if want[v.ID] {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// ListRecentPublishedVideoIDs 补拉接口的内存实现:按作者过滤、按 published_at 倒序取前 n 条,
+// 与真实实现语义一致(测试不覆盖补拉,但接口必须完整实现)
+func (r *pagedFeedRepo) ListRecentPublishedVideoIDs(_ context.Context, authorID int64, n int) ([]VideoRef, error) {
+	var out []VideoRef
+	for _, v := range r.videos {
+		// published_at 列可空,真实实现按指针扫描并靠调用方跳过 NULL;这里同样只收非 NULL
+		if v.AuthorID != authorID || v.Status != video.StatusPublished || v.PublishedAt == nil {
+			continue
+		}
+		out = append(out, VideoRef{ID: v.ID, PublishedAt: v.PublishedAt})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].PublishedAt.Equal(*out[j].PublishedAt) {
+			return out[i].PublishedAt.After(*out[j].PublishedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
+	if n >= 0 && len(out) > n {
+		out = out[:n]
+	}
+	return out, nil
+}
+
 // newLatestService userID 传 0 走匿名分支,setLikeStatuses 会直接返回,
 // 所以第三个参数(likes 提供方)可以传 nil
 func newLatestService(t *testing.T, videos []*video.Video) *FeedService {
@@ -54,7 +92,7 @@ func newLatestService(t *testing.T, videos []*video.Video) *FeedService {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewFeedService(&pagedFeedRepo{videos: videos}, rdb, nil)
+	return NewFeedService(&pagedFeedRepo{videos: videos}, rdb, nil, nil, nil)
 }
 
 func publishedAt(id int64, at time.Time) *video.Video {

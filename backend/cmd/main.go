@@ -17,6 +17,7 @@ import (
 	"feed-system/internal/middleware"
 	"feed-system/internal/model/account"
 	"feed-system/internal/model/feed"
+	"feed-system/internal/model/follow"
 	"feed-system/internal/model/video"
 	"feed-system/internal/pkg/logger"
 )
@@ -93,9 +94,32 @@ func main() {
 	videoRepo := video.NewVideoRepository(db)
 	videoSvc := video.NewVideoService(videoRepo, rdb, userInfoAdapter{repo: userRepo})
 	videoHandler := video.NewVideoHandler(videoSvc)
+
+	// 关注流接线。顺序不能随意换:
+	// fanoutWorker 同时满足 follow 包的三个接缝 —— FollowBackfiller(关注后补拉历史)、
+	// BigVDowngradeReplayer(大V 降级后重放缓存)与 BigVPromoter(大V 升入后回填缓存)
+	// ——所以它必须先建出来,才能喂给 NewFollowService。
+	followRepo := follow.NewFollowRepository(db)
+	bigvSet := follow.NewBigVSet(followRepo, rdb)
+
 	feedRepo := feed.NewFeedRepository(db)
-	feedSvc := feed.NewFeedService(feedRepo, rdb, videoSvc)
+	fanoutRepo := feed.NewFanoutRepository(db)
+	// followers 传 followRepo(满足 feed.FollowerLister),bigvs 传 bigvSet(满足
+	// feed.BigVChecker)。feed 不 import follow,靠接口解耦,避免循环依赖
+	fanoutWorker := feed.NewFanoutWorker(fanoutRepo, feedRepo, followRepo, bigvSet, rdb)
+
+	followSvc := follow.NewFollowService(followRepo, bigvSet, fanoutWorker, fanoutWorker, fanoutWorker)
+	followHandler := follow.NewFollowHandler(followSvc)
+
+	// feed 服务:likes 用 videoSvc,关注列表用 followRepo,大V 判定用 bigvSet
+	feedSvc := feed.NewFeedService(feedRepo, rdb, videoSvc, followRepo, bigvSet)
 	feedHandler := feed.NewFeedHandler(feedSvc)
+
+	// fan-out worker 后台常驻:轮询 fanout_tasks,把新发布视频投进粉丝收件箱。
+	// 用独立的可取消 ctx,退出时先停它再关连接,免得它拿着已关闭的 DB/Redis 继续跑。
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	defer stopWorker()
+	go fanoutWorker.Run(workerCtx)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -118,8 +142,12 @@ func main() {
 
 	v1 := r.Group("/api/v1")
 	account.RegisterRouter(v1, accountHandler, db, rdb)
-	// 先注册 feed 的 /videos/latest,避免被 video 的 /videos/:id 参数路由匹配。
+	// feed 注册 /videos/latest 与 /videos/following,follow 注册 /users/:id/follow 等。
+	// 它们与 video/account 共用 /videos、/users 前缀:gin 按 HTTP 方法 + 路径段建树,
+	// 同一层的静态段(latest/following/me)恒优先命中参数段(:id),两者可共存 ——
+	// 与注册先后无关,顺序在这里不影响匹配结果。
 	feed.RegisterRouter(v1, feedHandler, db, rdb)
+	follow.RegisterRouter(v1, followHandler, db, rdb)
 	video.RegisterRouter(v1, videoHandler, db, rdb)
 
 	addr := getEnv("HTTP_ADDR", ":8080")
@@ -145,6 +173,8 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server 关闭失败: %v", err)
 	}
+	// 先停 fan-out worker(可能正卡在投递里),再关连接,避免它拿着已关闭的资源继续跑
+	stopWorker()
 	if rdb != nil {
 		_ = rdb.Close()
 	}
