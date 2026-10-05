@@ -21,6 +21,8 @@ func RegisterRouter(rg *gin.RouterGroup, h *FeedHandler, db *gorm.DB, rdb *redis
 		middleware.Auth(db, rdb),
 	)
 	pub.GET("/latest", h.ListLatest)
+	// 点赞流:游客也能看,带 token 时额外带上 per-user 的点赞态(与最新流同口径)
+	pub.GET("/like", h.ListLike)
 
 	// 关注流强制登录:SetSensitive 让无 token 的直接 401,是纵深防御,
 	// 不单纯依赖 ListFollowing 内部 userID <= 0 的兜底。

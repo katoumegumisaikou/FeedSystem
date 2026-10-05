@@ -45,3 +45,18 @@ func (h *FeedHandler) ListFollowing(c *gin.Context) {
 	}
 	response.OK(c, resp)
 }
+
+func (h *FeedHandler) ListLike(c *gin.Context) {
+	var req ListLikeReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("查询参数无效"))
+		return
+	}
+
+	resp, err := h.svc.ListLike(c.Request.Context(), req, middleware.UserID(c))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
