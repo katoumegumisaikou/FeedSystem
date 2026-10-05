@@ -80,6 +80,13 @@ type fakeVideoRepo struct {
 	lastFields map[string]any // 记下最后一次写了哪些列
 	updateErr  error
 
+	publishCalls    int       // MarkPublished 被调了几次,用于断言发布恰好入队一次
+	lastPublishedAt time.Time // 最近一次入队带的 published_at,用于断言用的是当下而非 created_at
+
+	// markPublishedRaceHook 在 MarkPublished 真正执行前触发,用来模拟
+	// 「服务层读到草稿之后、仓储执行之前,另一个并发发布已把状态改成已发布」这个竞态窗口
+	markPublishedRaceHook func()
+
 	records []*PlayRecord // 记下写进来的播放流水,同时当观看历史的查询源
 	saveErr error
 
@@ -232,6 +239,33 @@ func (f *fakeVideoRepo) UpdateVideoFields(ctx context.Context, id int64, fields 
 	return nil
 }
 
+// MarkPublished 复刻真实实现的条件更新语义:只有当前状态是草稿才写列并「入队」。
+// 状态已被别人抢先翻成已发布时,真实实现影响 0 行、跳过 outbox;这里同样直接返回,
+// 既不累加 publishCalls 也不改 published_at。
+//
+// 诚实边界:内存 fake 单线程执行,复现不了真正的并发时序。这条只钉住「状态已非草稿
+// 时必须 0 行、不覆写 published_at、不入队」这个契约;真正的原子性来自 repo.go 里
+// UPDATE ... WHERE status = 草稿 的条件更新,需要真实 PostgreSQL 才能验证。
+func (f *fakeVideoRepo) MarkPublished(ctx context.Context, videoID, authorID int64) error {
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	if f.markPublishedRaceHook != nil {
+		f.markPublishedRaceHook()
+	}
+	v, ok := f.videos[videoID]
+	if !ok || v.Status != StatusDraft {
+		return nil // 条件更新 0 行:别人已抢先发布,不动列也不入队
+	}
+	now := time.Now()
+	f.publishCalls++
+	f.lastPublishedAt = now
+	f.lastFields = map[string]any{"status": StatusPublished, "published_at": now}
+	v.Status = StatusPublished
+	v.PublishedAt = &now
+	return nil
+}
+
 const testUserID int64 = 7
 
 func draftVideo() *Video {
@@ -347,7 +381,22 @@ func TestPublishVideo(t *testing.T) {
 		resp, err := svc.PublishVideo(ctx, 1, testUserID)
 		require.NoError(t, err)
 		assert.Equal(t, StatusPublished, resp.Status)
-		assert.Equal(t, StatusPublished, repo.lastFields["status"])
+		assert.Equal(t, StatusPublished, repo.videos[1].Status, "发布后视频状态应真的落成已发布")
+	})
+
+	t.Run("首次发布写入一条 fan-out 任务且用当下时刻当 published_at", func(t *testing.T) {
+		v := draftVideo()
+		// 上传于 10 天前、之后才发布的长期草稿 —— 修复前会带着这个旧时刻入队
+		v.CreatedAt = time.Now().Add(-10 * 24 * time.Hour)
+		svc, repo := newTestService(v)
+
+		_, err := svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err)
+
+		assert.Equal(t, 1, repo.publishCalls, "发布恰好入队一次")
+		assert.NotEqual(t, v.CreatedAt, repo.lastPublishedAt, "不能复用 created_at(上传时刻)")
+		// 发布时刻必须是当下,才落在 7 天 fan-out 窗口内,视频才不会被投递时裁掉
+		assert.WithinDuration(t, time.Now(), repo.lastPublishedAt, time.Minute)
 	})
 
 	t.Run("重复发布幂等且不再写库", func(t *testing.T) {
@@ -359,6 +408,26 @@ func TestPublishVideo(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, StatusPublished, resp.Status)
 		assert.Nil(t, repo.lastFields, "已发布的再调一次不该产生写操作")
+	})
+
+	// 并发重复发布:两个请求都在服务层看到 StatusDraft,但只有一个真正完成迁移。
+	// 用 hook 模拟「本请求已通过服务层校验、正要写库时,另一个请求抢先发布」的窗口。
+	//
+	// 诚实边界:内存 fake 是单线程的,复现不了真实竞态;这里钉的是「仓储在状态已非草稿时
+	// 必须 0 行、不覆写 published_at、不入队」这一契约。真正的原子性来自 repo.go 的
+	// UPDATE ... WHERE status = 草稿 条件更新,需真实 PostgreSQL 才能验证。
+	t.Run("并发重复发布:条件更新 0 行时不覆写 published_at 且不入队", func(t *testing.T) {
+		v := draftVideo()
+		svc, repo := newTestService(v)
+		// 另一个请求抢先把状态改成已发布(它自己不留下任何写操作痕迹)
+		repo.markPublishedRaceHook = func() { v.Status = StatusPublished }
+
+		resp, err := svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err, "重复发布应幂等成功,不能报错")
+		assert.Equal(t, StatusPublished, resp.Status)
+		assert.Equal(t, 0, repo.publishCalls, "条件更新 0 行时不该入队")
+		assert.Nil(t, repo.lastFields, "0 行时不该写任何列(尤其不能覆写 published_at)")
+		assert.Nil(t, v.PublishedAt, "published_at 没有被后到的写覆盖")
 	})
 
 	t.Run("已下架不能发布", func(t *testing.T) {

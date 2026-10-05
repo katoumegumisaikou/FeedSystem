@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // VideoRepository 视频仓储接口(对外暴露的唯一契约)。
@@ -49,6 +50,21 @@ type VideoRepository interface {
 	// 两件事必须同生共死:流水是明细、play_count 是读列表直接用的聚合,
 	// 只成一件就会出现「有明细没计数」这种对不上的漂移
 	SavePlayReport(ctx context.Context, r *PlayRecord) error
+
+	// MarkPublished 在一个事务里把「草稿」置为已发布,并写入一条 fan-out 任务。
+	//
+	// 两件事必须同生共死:分开写会在中间失败时留下「已发布但没 fan-out」的视频,
+	// 而那种视频不会出现在任何粉丝的关注流里,且没有任何补偿路径。
+	//
+	// 状态更新带 WHERE status = 草稿 条件,只有真正完成这次迁移的事务才写列并插 outbox:
+	// 并发重复发布时其它事务影响 0 行,直接跳过入队(实现内见细节)。
+	//
+	// 发布时刻由本方法内部取 time.Now(),不从外部传入:关注流按 published_at 排序,
+	// 它必须是「当下」的时刻才能保证落在 7 天投递窗口内。若拿 video.CreatedAt
+	// (上传时刻)当它,长期草稿会带着旧时间戳入队,投递时被窗口当场裁掉。
+	//
+	// 任务靠 UNIQUE (video_id, task_type) 幂等 —— 重复发布不会产生第二条同类型任务。
+	MarkPublished(ctx context.Context, videoID, authorID int64) error
 
 	// UpdateVideoFields 只更新传入的列,updated_at 由 GORM 自动填。
 	// 用 map 而不是 struct:struct 更新会跳过零值,把 Description 清空成 "" 就写不进库
@@ -193,6 +209,47 @@ func (r *videoRepository) SavePlayReport(ctx context.Context, rec *PlayRecord) e
 			Where("id = ?", rec.VideoID).
 			// UpdateColumn 而非 Update:播放数涨了不等于内容被改动,不该顺带顶掉 updated_at
 			UpdateColumn("play_count", gorm.Expr("play_count + 1")).Error
+	})
+}
+
+// MarkPublished 状态与 fan-out 任务必须一起落库,所以包一个事务:
+// 分开写会在中间失败时留下「已发布却没进粉丝关注流」的视频,而它没有自愈途径。
+// 任务表靠 UNIQUE (video_id, task_type),重复发布插入冲突时直接跳过,天然幂等。
+//
+// published_at 取当下的 time.Now(),而不是复用 videos.created_at:后者是上传时刻,
+// 长期草稿会在发布时带着一个很旧的时刻进入 7 天投递窗口,被 fan-out 脚本当场裁掉。
+func (r *videoRepository) MarkPublished(ctx context.Context, videoID, authorID int64) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		publishedAt := time.Now()
+		// 条件更新:只允许「草稿 → 已发布」这一次真实迁移。两个并发的 POST /publish
+		// 都会在服务层看到 StatusDraft,无条件写的话后到者会把 published_at 覆盖成更晚的
+		// 时刻,而它的 outbox 行会被 ON CONFLICT DO NOTHING 跳过(先到者的任务已占住
+		// UNIQUE (video_id, task_type))—— 于是 videos.published_at(展示与列过滤用)与
+		// outbox.published_at(ZSET score、游标用)各说各话,关注流排序与翻页就会漏条/重复。
+		// 加 WHERE status = 草稿 后只有真正完成迁移的事务写列。
+		res := tx.Model(&Video{}).
+			Where("id = ? AND status = ?", videoID, StatusDraft).
+			Updates(map[string]any{
+				"status":       StatusPublished,
+				"published_at": publishedAt,
+			})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			// 0 行 = 别人已抢先发布(或状态已被改走)。此时既不覆写列也不入队:
+			// 只有「真正迁移了」的那次才允许写 outbox,列与行才永远同源。
+			// 任务表本就靠 UNIQUE 去重,这里跳过不影响幂等,服务层按成功返回。
+			return nil
+		}
+		// 只列写入用得到的三列,status / attempts 等交给库默认值 —— 列全抄一遍就多一份会漂移的 schema
+		return tx.Table("fanout_tasks").
+			Clauses(clause.OnConflict{DoNothing: true}).
+			Create(map[string]any{
+				"video_id":     videoID,
+				"author_id":    authorID,
+				"published_at": publishedAt,
+			}).Error
 	})
 }
 

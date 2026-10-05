@@ -749,7 +749,10 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 		return nil, errs.ErrConflict.WithMsg("当前状态不能发布")
 	}
 
-	if err := s.videorepo.UpdateVideoFields(ctx, videoID, map[string]any{"status": StatusPublished}); err != nil {
+	// 发布时刻由 MarkPublished 内部取 time.Now(),不能复用 video.CreatedAt:
+	// created_at 是上传时刻,一个传完搁置很久才发布的草稿会带着旧时刻入队,
+	// 被 fan-out 的 7 天窗口当场裁掉,视频就永远进不了任何粉丝的关注流
+	if err := s.videorepo.MarkPublished(ctx, videoID, video.AuthorID); err != nil {
 		slog.ErrorContext(ctx, "发布视频失败", "video_id", videoID, "user_id", userID, "err", err)
 		return nil, errs.ErrInternal.WithMsg("发布视频失败")
 	}
