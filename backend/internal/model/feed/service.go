@@ -57,6 +57,11 @@ func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProv
 //     判断是疏漏而非设计 —— publish 路径对收件箱(fanout.go 的 push)和大V 缓存
 //     都主动写了,说明「发布时要主动写入」这个做法是知道的,只是漏了 latest。
 //
+//     真库实测:库里 id=3、id=4 均已发布,而缓存里只有 id=1(已软删)的卡片,
+//     GET /videos/latest 就只返回 [1];手动 DEL 这个 key 后立刻变成 [4,3]。
+//     也就是说缓存里的陈旧条目会**遮蔽**新条目 —— 不是"旧的没更新",
+//     是"新的根本进不来"。
+//
 //  2. 卡片里的展示字段陈旧最长 1 小时。Title / CoverURL / LikesCount / PlayCount /
 //     Status 都烤进了 JSON,改标题、换封面、点赞都不会让它失效。点赞那条尤其没法
 //     用失效钩子解决 —— 点赞是高频写,每次删 500 条的 key 等于缓存常驻失效。
@@ -70,8 +75,13 @@ func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProv
 // 那边的做法(feed:inbox:<uid> 只存 video_id,读的时候回表),同一个系统里两个流
 // 用了两种设计,latest 这个选错了。
 //
+// 注意「补一个失效钩子」解决不了症状 1 与 2:失效只能在删除时机上做文章,
+// 而这两个症状的根源是**写入时机** —— 缓存建好后没有任何东西会再往里写。
+// 唯一能覆盖的是症状 3(可以在 DeleteVideo 里 Del),而且它需要跨模块接缝。
+//
 // 之所以先不做:改动落在 ListLatest 里注释最密的那段分页逻辑(score 只到秒、
 // 同秒靠 member 字典序、所以统一再排一次),风险与收益需要单独权衡。
+// 实测与完整分析另见 docs/realdb-findings.md 的 B2。
 const (
 	latestVideosKey    = "feed:video:latest"
 	latestVideosTTL    = time.Hour
