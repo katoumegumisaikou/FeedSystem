@@ -69,3 +69,26 @@ func Parse(tokenStr string) (*Claims, error) {
 	}
 	return nil, errors.New("token 无效")
 }
+
+// 撤销黑名单的 Redis key 前缀。放这里而不是分别写在读写两侧,是因为两边**必须**
+// 用同一个算法:写侧(account.Service.Logout)与读侧(middleware.Auth)各写一份字面量
+// 迟早会漂移,而 Redis 对不存在的 key 返回「不存在」而非报错 —— 漂移是静默的,
+// 表现为「登出后 token 依然有效」,现场没有任何报错可查。
+//
+// 前缀沿用项目既有的 feed:revoked:*,不要改 —— 改了就与已在 Redis 里的标记不再匹配。
+const (
+	revokedAccessPrefix  = "feed:revoked:access:"
+	revokedRefreshPrefix = "feed:revoked:refresh:"
+)
+
+// RevokedAccessKey 某个 access_token 的撤销标记 key。
+// 粒度是单个 token(不是每用户),这样登出只结束当前这台设备的会话,
+// 不会把用户的其他设备一起踢下线 —— 这也正是它与递增 users.version 的区别。
+func RevokedAccessKey(accessToken string) string {
+	return revokedAccessPrefix + accessToken
+}
+
+// RevokedRefreshKey 某个 refresh_token 的撤销标记 key
+func RevokedRefreshKey(refreshToken string) string {
+	return revokedRefreshPrefix + refreshToken
+}

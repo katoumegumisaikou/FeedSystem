@@ -214,20 +214,23 @@ func (s *AccountService) Logout(ctx context.Context, accessToken, refreshToken s
 		return errs.ErrUnauthorized.WithMsg("refresh_token 缺失")
 	}
 
-	// refresh_token 入黑名单(TTL 到其过期为止,约 30 天)
+	// refresh_token 入黑名单(TTL 到其过期为止,约 30 天)。
+	// key 走 token.RevokedRefreshKey —— 读侧(middleware.Auth / Refresh)用同一个函数,
+	// 两边不许各写一份字面量:Redis 查不存在的 key 不报错,漂移会静默表现为「登出无效」
 	if claims, err := token.Parse(refreshToken); err == nil && claims.ExpiresAt != nil {
 		ttl := time.Until(claims.ExpiresAt.Time)
 		if ttl > 0 && s.rdb != nil {
-			s.rdb.Set(ctx, "feed:revoked:refresh:"+refreshToken, claims.UserID, ttl)
+			s.rdb.Set(ctx, token.RevokedRefreshKey(refreshToken), claims.UserID, ttl)
 		}
 	}
 
-	// access_token 入黑名单(约 2 小时)
+	// access_token 入黑名单(约 2 小时)。
+	// 粒度是单个 token 而非每用户:登出只结束当前这台设备,不踢用户的其他设备
 	if accessToken != "" {
 		if claims, err := token.Parse(accessToken); err == nil && claims.ExpiresAt != nil {
 			ttl := time.Until(claims.ExpiresAt.Time)
 			if ttl > 0 && s.rdb != nil {
-				s.rdb.Set(ctx, "feed:revoked:access:"+accessToken, claims.UserID, ttl)
+				s.rdb.Set(ctx, token.RevokedAccessKey(accessToken), claims.UserID, ttl)
 			}
 		}
 	}
@@ -381,7 +384,7 @@ func (s *AccountService) RefreshToken(ctx context.Context, refreshToken string) 
 	}
 
 	if s.rdb != nil {
-		blacklisted, err := s.rdb.Exists(ctx, "feed:revoked:refresh:"+refreshToken).Result()
+		blacklisted, err := s.rdb.Exists(ctx, token.RevokedRefreshKey(refreshToken)).Result()
 		if err != nil {
 			return nil, errs.ErrInternal.WithMsg("校验 refresh_token 失败")
 		}
@@ -407,7 +410,7 @@ func (s *AccountService) RefreshToken(ctx context.Context, refreshToken string) 
 	if s.rdb != nil && claims.ExpiresAt != nil {
 		ttl := time.Until(claims.ExpiresAt.Time)
 		if ttl > 0 {
-			s.rdb.Set(ctx, "feed:revoked:refresh:"+refreshToken, claims.UserID, ttl)
+			s.rdb.Set(ctx, token.RevokedRefreshKey(refreshToken), claims.UserID, ttl)
 		}
 	}
 

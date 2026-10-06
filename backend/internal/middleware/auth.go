@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -51,12 +52,47 @@ func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 			return
 		}
 
+		// 登出黑名单。必须排在 version 校验之前:
+		// 两者都是 O(1),但 version 走 sfcache,缓存未命中时会回源 DB;
+		// 而黑名单只是一次 Redis EXISTS。被撤销的 token 不必再付那次 DB 开销
+		if tokenRevoked(c.Request.Context(), rdb, tokenStr) {
+			abortUnauthorized(c, "token 已失效,请重新登录")
+			return
+		}
+
 		if !checkUserVersion(c, db, rdb, claims.UserID, claims.Version) {
 			return
 		}
 		c.Set(userIDKey, claims.UserID)
 		c.Next()
 	}
+}
+
+// tokenRevoked 查 access_token 是否已被登出拉黑。
+//
+// 与 users.version 的分工:version 是**每用户**一个,改密码时递增,会把该用户所有
+// 设备一起下线;黑名单是**每个 token** 一个,登出只结束当前会话。两个都留着 ——
+// 「怀疑账号被盗,全下线」和「我只是想退出这台设备」是两件不同的事。
+//
+// 查询失败一律放行(fail-open),理由与限流器的 fail-open 同源,但这里的取舍值得写明:
+//   - rdb == nil 是 main.go 的既定路径(mustRedisClient 连不上就返回 nil,
+//     设计上「鉴权仍走 DB」)。若在这里 fail-closed,没有 Redis 就等于所有人无法登录,
+//     把可选依赖变成硬依赖
+//   - Redis 临时故障时,代价是「已登出的 token 最长还能用到它自己的 exp(≤2h)」,
+//     而不是全站鉴权挂掉。两害相权取轻
+//
+// 已知残留:写侧(Logout)若因 Redis 故障没写成功,登出会静默不生效,两侧都没有补偿。
+// 要彻底解决得让撤销状态脱离外部存储(例如短 TTL + 轮换签名密钥),不在本改动范围内。
+func tokenRevoked(ctx context.Context, rdb *redis.Client, accessToken string) bool {
+	if rdb == nil {
+		return false
+	}
+	n, err := rdb.Exists(ctx, token.RevokedAccessKey(accessToken)).Result()
+	if err != nil {
+		slog.ErrorContext(ctx, "查询 token 黑名单失败,本次放行", "err", err)
+		return false
+	}
+	return n > 0
 }
 
 // checkUserVersion 比对 token 中的 version 与 DB 当前 version,不一致则 401 ——
