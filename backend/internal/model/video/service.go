@@ -551,6 +551,29 @@ func validCoverURL(u string) bool {
 	return strings.HasPrefix(u, CoverURLPrefix+"/") && !strings.Contains(u, "..")
 }
 
+// coverPathInOwnDir 把一条封面 URL 映射成磁盘路径,但只当它落在该视频自己的
+// 封面目录下时才返回 (路径, true)。第二个返回值 false 的含义是「不要动它」。
+//
+// 为什么要卡目录,而不是「只要是 /covers/ 开头就删」:cover_url 可以跨视频复用 ——
+// PUT /videos/:id 接受任意合法的站内封面地址,用户完全可能把 A 的封面设给 B。
+// 那种情况下 B 换封面时删掉 A 的文件,就是删了别人正在用的东西;
+// 而 B 换不动 A 的封面字段,所以没有任何东西会去发现这件事。
+// 只清理自己目录里的文件,这条规则不需要多查一条引用关系就成立。
+func coverPathInOwnDir(coverURL string, videoID int64) (string, bool) {
+	prefix := CoverURLPrefix + "/" + strconv.FormatInt(videoID, 10) + "/"
+	if !strings.HasPrefix(coverURL, prefix) {
+		return "", false
+	}
+	// 剩下那段必须正好是一个文件名:Base 变了说明带了路径分隔符,
+	// 空名和 . / .. 也不是文件名。这一层是防看:即使以后有人绕过
+	// validCoverURL 把值写进库,拼出来的路径也出不了这个目录
+	name := strings.TrimPrefix(coverURL, prefix)
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
+		return "", false
+	}
+	return filepath.Join(CoverStorageDir, strconv.FormatInt(videoID, 10), name), true
+}
+
 // UploadCover 上传封面文件并直接应用到该视频(POST /videos/:id/cover)。
 // 照头像上传那套写,差别只有两点:归属与状态校验、存储目录按 videoID 分。
 //
@@ -563,6 +586,10 @@ func validCoverURL(u string) bool {
 // 反过来先写库,一旦写库成功而落盘失败,数据库里就留下一个指向不存在文件的 cover_url,
 // 列表页当场图裂,而且没有任何东西会去修它。所以先让文件真实存在,再让数据库指向它;
 // 写库失败就把刚落的文件删掉,对外表现为一次干净的整体失败。
+//
+// 写库成功后顺带删掉旧封面文件(只删这条视频自己目录下的,见 coverPathInOwnDir)。
+// 不删的话每换一次封面就在磁盘上多留一个谁也不引用的文件,而这是唯一知道
+// 「刚才那张是哪张」的时刻 —— 过了这一次,引用关系就被覆盖了,再没有机会补删。
 func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, fileheader *multipart.FileHeader) (*UploadCoverResp, error) {
 	// 归属与状态:不是作者 403、视频不存在 404、未登录 401、已下架 409。
 	// 与 UpdateVideo 完全一致 —— 这一步就是在改那条视频的 cover_url 字段
@@ -651,6 +678,10 @@ func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, f
 	// 前端想在保存草稿时一并提交封面,那条路径依然可用
 	coverURL := CoverURLPrefix + "/" + strconv.FormatInt(videoID, 10) + "/" + fileName
 
+	// 记下旧封面,写库成功后才动它。此刻它还在被引用,写库假如失败,
+	// 下面会回滚新文件,而这个旧文件必须原封不动 —— 它仍是库里存着的那个
+	oldCoverURL := video.CoverURL
+
 	// 写库。失败就删掉刚落的文件:留着的话它永远不会被任何视频引用,
 	// 而客户端看到的是一次失败 —— 它无从知道服务器上多了一个文件要清理
 	if err := s.videorepo.UpdateVideoFields(ctx, videoID, map[string]any{"cover_url": coverURL}); err != nil {
@@ -661,6 +692,16 @@ func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, f
 	// 详情缓存里存的是 Video 实体,带着旧的 cover_url。不失效就会「换完封面刷新还是旧图」,
 	// 直到 TTL 过期 —— 与 UpdateVideo 同一条理由,也要排在写库之后
 	s.invalidateVideoDetail(ctx, videoID)
+
+	// 换封面会让旧文件变成孤儿:这条视频已经不再引用它,却还占着磁盘。
+	// 位置必须在写库成功之后 —— 上面若失败,它还是库里那个值。
+	// 删失败只记 Warn:新封面已经落库并生效,不该为一次清理反过来报错;
+	// 真删不掉也只是回到「多一个文件」的旧状态,不引入新的不一致
+	if oldPath, ok := coverPathInOwnDir(oldCoverURL, videoID); ok {
+		if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+			slog.WarnContext(ctx, "删除旧封面文件失败", "video_id", videoID, "path", oldPath, "err", err)
+		}
+	}
 
 	return &UploadCoverResp{CoverURL: coverURL}, nil
 }
@@ -883,7 +924,12 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 	switch video.Status {
 	case StatusPublished:
 		// 重复发布当成功:客户端响应丢包重试会走到这,
-		// 报错会让用户以为没发出去
+		// 报错会让用户以为没发出去。
+		//
+		// 这里也失效一次:第一次发布可能已经写库成功、却崩在写库与删缓存之间,
+		// 那条残留的 draft 判定靠这次重试清掉 —— 否则重试拿到 200,
+		// 匿名用户却仍然下不到文件,而两个结果都是「成功」
+		s.invalidatePlayAccess(ctx, video.PlayURL)
 		return s.videoRespForUser(ctx, userID, video)
 	case StatusDraft:
 		// 继续往下
@@ -900,6 +946,9 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 	}
 	// 状态变了,详情缓存里的旧状态会让匿名用户继续 404
 	s.invalidateVideoDetail(ctx, videoID)
+	// 文件路由的判定缓存同样冻着 draft。不删的话详情页已经显示「已发布」,
+	// 而这个文件的下载最长 5 分钟内仍然是 404 —— 两个接口对同一份状态各说各话
+	s.invalidatePlayAccess(ctx, video.PlayURL)
 	video.Status = StatusPublished
 	return s.videoRespForUser(ctx, userID, video)
 }
@@ -980,7 +1029,11 @@ func (s *VideoService) UnlikeVideo(ctx context.Context, videoID, userID int64) (
 // 被删视频的那张卡片最多残留一个 latestVideosTTL(1 小时)。期间它会出现在最新流列表里,
 // 但点开是 404 —— 详情与文件路由都回 DB,软删过滤在那里生效。
 // 关注流不受影响:那边只存 video_id,回表时被软删过滤挡掉。
-// 要彻底清掉它需要 feed 暴露一个失效钩子,涉及跨模块接缝,不在本次改动范围内。
+// 完整分析(这不是唯一症状,同根因的还有「新视频进不了最新流」)见
+// feed/service.go 里 latestVideosKey 上面的 TODO(待议⑤)。
+// 修法与失效钩子无关:那边改成「缓存只存排序、内容回表」即可自愈,不需要这里配合。
+// 真要临时缓解,可以在下面加一次 feed 的 Del —— 但那需要一个跨模块接缝接口,
+// 且治不了「新视频进不来」那个主要症状,所以不做。
 func (s *VideoService) DeleteVideo(ctx context.Context, videoID, userID int64) error {
 	if userID <= 0 {
 		return errs.ErrUnauthorized.WithMsg("用户未登录")
@@ -1009,6 +1062,10 @@ func (s *VideoService) DeleteVideo(ctx context.Context, videoID, userID int64) e
 	// 详情缓存里还留着这条实体,而软删过滤在 findVideo 里、缓存挡在它前面 ——
 	// 不删缓存会让已删除的视频继续可读
 	s.invalidateVideoDetail(ctx, videoID)
+	// 判定缓存里还写着 Found=true,不删的话已经删掉的文件最长 5 分钟内仍能下载。
+	// 详情 / 列表靠回 DB 当场就看不见了,只有文件路由挡在缓存后面 ——
+	// 不补这一刀,「删了但还能下」正是最难解释的一种状态
+	s.invalidatePlayAccess(ctx, video.PlayURL)
 	return nil
 }
 

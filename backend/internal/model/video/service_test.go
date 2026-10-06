@@ -1401,6 +1401,108 @@ func TestUploadCover(t *testing.T) {
 		assert.Equal(t, resp.CoverURL, detail.CoverURL,
 			"不失效详情缓存的话,这里读到的还是 old.png")
 	})
+
+	t.Run("换封面时删掉自己目录下的旧文件", func(t *testing.T) {
+		v := publishedVideo()
+		v.CoverURL = "/covers/1/old.png"
+		svc, _ := newTestService(v)
+
+		dir := filepath.Join(CoverStorageDir, "1")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "old.png"), []byte("old"), 0o644))
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+		resp, err := svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))
+		require.NoError(t, err)
+
+		_, statErr := os.Stat(filepath.Join(dir, "old.png"))
+		assert.True(t, os.IsNotExist(statErr),
+			"旧封面该被删掉,否则每换一次封面就多留一个孤儿文件")
+
+		entries, readErr := os.ReadDir(dir)
+		require.NoError(t, readErr)
+		require.Len(t, entries, 1, "目录里只该剩下新封面,实际 %v", entries)
+		assert.Equal(t, filepath.Base(resp.CoverURL), entries[0].Name())
+	})
+
+	t.Run("写库失败时不删旧文件", func(t *testing.T) {
+		// 对照组:清理必须排在写库成功之后。写库失败时旧封面仍是库里那个值,
+		// 把它删掉就是拿一个指向空文件的状态去换另一个坏状态
+		v := publishedVideo()
+		v.CoverURL = "/covers/1/old.png"
+		svc, repo := newTestService(v)
+		repo.updateErr = errors.New("db down")
+
+		dir := filepath.Join(CoverStorageDir, "1")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		oldPath := filepath.Join(dir, "old.png")
+		require.NoError(t, os.WriteFile(oldPath, []byte("old"), 0o644))
+		t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))),
+			errs.ErrInternal)
+
+		_, statErr := os.Stat(oldPath)
+		assert.NoError(t, statErr, "写库失败时旧封面必须留着 —— 它还在被引用")
+	})
+
+	t.Run("旧封面在别人目录下时不删", func(t *testing.T) {
+		// cover_url 可以跨视频复用:用户把别人的封面设成了自己的。
+		// 这时删掉它就是删了别人正在用的文件,而对方(乃至他自己)永远发现不了
+		v := publishedVideo()
+		v.CoverURL = "/covers/999/shared.png"
+		svc, _ := newTestService(v)
+
+		otherDir := filepath.Join(CoverStorageDir, "999")
+		require.NoError(t, os.MkdirAll(otherDir, 0o755))
+		sharedPath := filepath.Join(otherDir, "shared.png")
+		require.NoError(t, os.WriteFile(sharedPath, []byte("other"), 0o644))
+		t.Cleanup(func() {
+			_ = os.RemoveAll(otherDir)
+			_ = os.RemoveAll(filepath.Join(CoverStorageDir, "1"))
+		})
+
+		_, err := svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))
+		require.NoError(t, err)
+
+		_, statErr := os.Stat(sharedPath)
+		assert.NoError(t, statErr, "只清自己目录下的文件,别人的封面不能动")
+	})
+}
+
+// TestCoverPathInOwnDir 封面 URL → 磁盘路径的映射,以及它的拒绝面。
+// 拼出来的路径是要交给 os.Remove 的,所以每一条「不该受理」的输入都必须返回 false
+func TestCoverPathInOwnDir(t *testing.T) {
+	own := filepath.Join(CoverStorageDir, "1", "a.png")
+	cases := []struct {
+		name     string
+		coverURL string
+		videoID  int64
+		wantPath string
+		wantOK   bool
+	}{
+		{"自己目录下的文件", "/covers/1/a.png", 1, own, true},
+		{"只有前缀没有文件名", "/covers/1", 1, "", false},
+		{"只有目录没有文件名", "/covers/1/", 1, "", false},
+		{"别人的目录", "/covers/2/a.png", 1, "", false},
+		{"前缀相近但 ID 不同", "/covers/11/a.png", 1, "", false},
+		{"多了层级", "/covers/1/sub/a.png", 1, "", false},
+		{"目录穿越", "/covers/1/../../etc/passwd", 1, "", false},
+		{"当前目录", "/covers/1/.", 1, "", false},
+		{"上级目录", "/covers/1/..", 1, "", false},
+		{"外站地址", "http://evil.com/a.png", 1, "", false},
+		{"前缀不完整", "/coversa/1/a.png", 1, "", false},
+		{"空串", "", 1, "", false},
+		{"已经删掉的空值", "/covers/1//a.png", 1, "", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path, ok := coverPathInOwnDir(tc.coverURL, tc.videoID)
+			assert.Equal(t, tc.wantOK, ok, "受理判断不符: %q", tc.coverURL)
+			assert.Equal(t, tc.wantPath, path)
+		})
+	}
 }
 
 // TestCoverURLReachesVideoDetail 封面从上传到详情返回的完整链路:

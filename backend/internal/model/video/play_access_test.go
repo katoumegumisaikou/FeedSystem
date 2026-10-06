@@ -28,6 +28,7 @@ const playTestBody = "0123456789"
 var playTestFiles = []string{
 	"pub.mp4", "draft.mp4", "removed.mp4", "ghost.mp4", "a.mp4",
 	"cached.mp4", "cached-ghost.mp4", "dirty.mp4", "roundtrip.mp4",
+	"publish-live.mp4", "delete-live.mp4",
 }
 
 // newPlayRouter 复刻 main.go 里 /videos 的挂载:软鉴权 → 可见性判定 → 静态文件服务。
@@ -238,6 +239,90 @@ func TestPlayAccess_与真Auth串联(t *testing.T) {
 	w := doGet(t, r, url, nil)
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, playTestBody, w.Body.String())
+}
+
+// TestPlayAccess_发布与删除后立即生效 判定缓存必须跟着 status 一起失效。
+//
+// 这两条是原始症状的端到端复现,不是「断言 key 被删了」:走的是同一套
+// 软鉴权 → PlayAccess → http.FileServer,而且文件真在盘上、正文在校验。
+//
+// 顺带钉住一个跨边界的等价关系:PublishVideo / DeleteVideo 用的是库里存的
+// video.PlayURL,而 PlayAccess 用的是 VideoURLPrefix + 路径通配段。两者必须
+// 拼出同一个字符串,否则 Del 删的是一个不存在的 key —— Redis 删不存在的 key
+// 返回成功、不报错,于是缓存永远清不掉,现场也没有任何报错可查。
+// 这条测试是那个等价关系的唯一防线
+func TestPlayAccess_发布与删除后立即生效(t *testing.T) {
+	const (
+		publishURL = "/videos/7/publish-live.mp4"
+		deleteURL  = "/videos/7/delete-live.mp4"
+	)
+
+	// newEnv 让 HTTP 层与 service 层共用同一个 repo 和 rdb —— 这正是生产里的形态:
+	// PlayAccess 拿 repo 反查,service 改库后去删同一个 rdb 里的 key
+	newEnv := func(t *testing.T, playURL string, status int8) (*gin.Engine, *VideoService, *fakeVideoRepo) {
+		t.Helper()
+
+		mr := miniredis.RunT(t)
+		rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		t.Cleanup(func() { _ = rdb.Close() })
+
+		v := videoAt(playURL, status)
+		v.ID = 1
+		repo := &fakeVideoRepo{videos: map[int64]*Video{1: v}}
+		return newPlayRouter(t, repo, rdb, 0), NewVideoService(repo, rdb, nil), repo
+	}
+
+	t.Run("草稿发布后,游客立刻能播放", func(t *testing.T) {
+		ctx := context.Background()
+		r, svc, repo := newEnv(t, publishURL, StatusDraft)
+
+		// 1. 游客先请求一次:404,并把 draft 这判定灌进缓存
+		require.Equal(t, http.StatusNotFound, doGet(t, r, publishURL, nil).Code)
+		require.Equal(t, 1, repo.playURLCalls, "前置条件:这一请求应当回源")
+
+		// 2. 作者发布
+		_, err := svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err)
+		require.Equal(t, StatusPublished, repo.videos[1].Status, "前置条件:状态真的翻过来了")
+
+		// 3. 同一个 URL 再请求:必须立刻放行,而不是等 5 分钟 TTL 过去
+		w := doGet(t, r, publishURL, nil)
+		require.Equal(t, http.StatusOK, w.Code,
+			"判定缓存没失效的话这里还是 404 —— 详情页已显示已发布,文件却下不到")
+		assert.Equal(t, playTestBody, w.Body.String())
+	})
+
+	t.Run("已发布视频删除后,立刻不可下载", func(t *testing.T) {
+		ctx := context.Background()
+		r, svc, repo := newEnv(t, deleteURL, StatusPublished)
+
+		// 1. 先能下,并把 published 判定灌进缓存
+		require.Equal(t, http.StatusOK, doGet(t, r, deleteURL, nil).Code)
+		require.Equal(t, 1, repo.playURLCalls)
+
+		// 2. 作者删除
+		require.NoError(t, svc.DeleteVideo(ctx, 1, testUserID))
+
+		// 3. 已经删掉的文件必须当场不可下载
+		assert.Equal(t, http.StatusNotFound, doGet(t, r, deleteURL, nil).Code,
+			"判定缓存里还写着 Found=true 的话,删了的文件最长 5 分钟内还能下")
+	})
+
+	t.Run("重复发布也清一次,治好上一次崩在两步之间的残留", func(t *testing.T) {
+		ctx := context.Background()
+		r, svc, _ := newEnv(t, publishURL, StatusDraft)
+
+		// 模拟「第一次发布写库成功、但删缓存那一步没执行」:状态已是已发布,
+		// 而缓存里还是那份 draft
+		require.Equal(t, http.StatusNotFound, doGet(t, r, publishURL, nil).Code)
+		svc.videorepo.(*fakeVideoRepo).videos[1].Status = StatusPublished
+
+		// 客户端没收到响应而重试:拿到成功,并且这一次必须把残留清掉
+		_, err := svc.PublishVideo(ctx, 1, testUserID)
+		require.NoError(t, err)
+
+		assert.Equal(t, http.StatusOK, doGet(t, r, publishURL, nil).Code)
+	})
 }
 
 // TestPlayTarget_经缓存往返 锁住 playTarget 能原样过一趟 Redis。

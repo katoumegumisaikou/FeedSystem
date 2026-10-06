@@ -45,6 +45,33 @@ func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProv
 	return &FeedService{repo: repo, rdb: rdb, likes: likes, followees: followees, bigvs: bigvs}
 }
 
+// latestVideosKey / latestVideosTTL 最新流的缓存。存的是完整卡片 JSON,以
+// created_at(秒)为 ZSET score,用 range 分页;只有 ListLatest 空 ZSET 那一次会回填,
+// 没有任何主动失效 —— 全进程只有 ListLatest 里那一处 ZAdd。
+//
+// TODO(已知设计缺口,待议⑤): 这个缓存承担的是「内容快照」而不是「索引」,带来三个症状 ——
+//
+//  1. 新视频最长 1 小时进不了最新流。回填只在 ZSET 为空时发生(见 ListLatest),
+//     缓存建好之后发布的视频没有任何路径能被追加进去,必须等 TTL 到点重建。
+//     这是三个症状里最严重的一个:「最新」流不显示最新视频,而对外表现完全正常。
+//     判断是疏漏而非设计 —— publish 路径对收件箱(fanout.go 的 push)和大V 缓存
+//     都主动写了,说明「发布时要主动写入」这个做法是知道的,只是漏了 latest。
+//
+//  2. 卡片里的展示字段陈旧最长 1 小时。Title / CoverURL / LikesCount / PlayCount /
+//     Status 都烤进了 JSON,改标题、换封面、点赞都不会让它失效。点赞那条尤其没法
+//     用失效钩子解决 —— 点赞是高频写,每次删 500 条的 key 等于缓存常驻失效。
+//
+//  3. 已删 / 已下架的视频卡片残留最长 1 小时,点开是 404(与 video/service.go
+//     里 DeleteVideo 那段注释记的是同一件事)。
+//
+// 修法是改结构而不是补失效:让这个 ZSET 只存排序信息(或存 id),内容一律回表取。
+// feed.FeedRepository 里已经有 ListVideosByIDs —— 它自带 status = 已发布 与软删
+// 过滤 —— 所以不需要改接口、不需要跨模块接缝,三个症状会一起消失。这也正是关注流
+// 那边的做法(feed:inbox:<uid> 只存 video_id,读的时候回表),同一个系统里两个流
+// 用了两种设计,latest 这个选错了。
+//
+// 之所以先不做:改动落在 ListLatest 里注释最密的那段分页逻辑(score 只到秒、
+// 同秒靠 member 字典序、所以统一再排一次),风险与收益需要单独权衡。
 const (
 	latestVideosKey    = "feed:video:latest"
 	latestVideosTTL    = time.Hour

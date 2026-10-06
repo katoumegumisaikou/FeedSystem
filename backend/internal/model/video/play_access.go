@@ -78,3 +78,20 @@ func PlayAccess(repo VideoRepository, rdb *redis.Client) gin.HandlerFunc {
 func playURLKey(playURL string) string {
 	return "video:play_url:" + playURL
 }
+
+// invalidatePlayAccess 清掉某个 play_url 的可见性判定缓存。
+//
+// 只在「可见性判定本身变了」时调用,也就是 status 变或 play_url 变。
+// 改标题 / 换封面都不必调:playTarget 只有 3 个字段,不含任何展示内容 ——
+// 这是它与 videoDetailKey 的关键差别,那边缓存的是整个实体,什么都得失效。
+//
+// 删失败只记日志,理由与 invalidateVideoDetail 相同 —— 调用方那边数据库已经改完,
+// 为一个缓存清理反过来报错会让用户误以为操作没生效。删不掉最多让旧判定多活一个 TTL
+func (s *VideoService) invalidatePlayAccess(ctx context.Context, playURL string) {
+	if s.rdb == nil {
+		return
+	}
+	if err := s.rdb.Del(ctx, playURLKey(playURL)).Err(); err != nil {
+		slog.ErrorContext(ctx, "删除播放可见性缓存失败", "play_url", playURL, "err", err)
+	}
+}
