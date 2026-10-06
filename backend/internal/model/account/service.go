@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"feed-system/internal/middleware"
 	"feed-system/internal/pkg/errs"
 	"feed-system/internal/pkg/token"
 	"feed-system/internal/util/filetype"
@@ -458,10 +459,17 @@ func (s *AccountService) ChangePassword(ctx context.Context, req ChangePasswordR
 	}
 
 	user.Password = hashed
-	user.Version++ // 让该用户所有旧 token 立刻失效
+	user.Version++ // 让该用户所有旧 token 失效
 	if err := s.userrepo.Update(ctx, user); err != nil {
 		return nil, errs.ErrInternal.WithMsg("更新用户失败")
 	}
+	// 必须排在 Update 成功之后,且不能省 —— checkUserVersion 走 sfcache(TTL 5 分钟),
+	// 不清缓存的话「立刻失效」实际要等最长 5 分钟。实测:改密后旧 access_token 仍
+	// 能用,而同刻旧 refresh_token 已失效(Refresh 直查 DB),两条路径结论矛盾。
+	//
+	// 顺序:先删则并发的读会把改动前的旧值灌回缓存,新值被挡住整个 TTL;
+	// 写库后再删,最坏只是「读到一个旧值后立刻被删掉」。与 invalidateVideoDetail 同理
+	middleware.InvalidateUserVersion(ctx, s.rdb, user.ID)
 
 	return &TokenResp{
 		AccessToken:  mustSignTokenWithVersion(user.ID, user.Version, token.DefaultAccessTTL),

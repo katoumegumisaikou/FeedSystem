@@ -139,6 +139,34 @@ func userVersionKey(userID int64) string {
 	return fmt.Sprintf("feed:user:version:%d", userID)
 }
 
+// InvalidateUserVersion 清掉某用户 version 的缓存。
+//
+// **任何递增 users.version 的地方都必须调用它**,否则 checkUserVersion 会继续用缓存里
+// 的旧值,「旧 token 立刻失效」实际变成「最长 versionCacheTTL 后失效」。
+// 这个坑已经踩过一次:ChangePassword 递增了 version 却没人清缓存,实测改密后旧
+// access_token 仍能用,而同一时刻旧 refresh_token 已经失效(Refresh 直查 DB、不经缓存)
+// —— 同一个 version 值给出两种判定,矛盾本身就是漏了失效的证据。
+//
+// 为什么放在 middleware 而不是让调用方自己拼 key:key 的算法是这份缓存的实现细节,
+// 读写必须共用同一份定义。两侧各写一份字面量迟早漂移,而 **Redis 删不存在的 key
+// 不报错** —— 漂移是静默的,表现为「改了 version 但 token 没失效」,
+// 现场没有任何报错可查。这与 token.RevokedAccessKey 是同一条理由。
+//
+// 删失败只记日志,不返回 error:调用方那边数据库已经提交,为一次缓存清理反过来报错
+// 会让用户以为改密失败。删不掉最多让旧 token 多活一个 TTL,下次读会自愈
+//
+// 已知残留(与各处的缓存失效同源,是有意接受):并发的读若恰好在「DB 提交之后、
+// 这次 Del 之前」完成回源,会把旧值重新写进缓存,于是新值被挡住一个 TTL。
+// 排序(写库后再删)已把窗口压到最窄,彻底消除需要版本号/CAS 式回填,不在本次范围
+func InvalidateUserVersion(ctx context.Context, rdb *redis.Client, userID int64) {
+	if rdb == nil {
+		return
+	}
+	if err := rdb.Del(ctx, userVersionKey(userID)).Err(); err != nil {
+		slog.ErrorContext(ctx, "删除用户 version 缓存失败", "user_id", userID, "err", err)
+	}
+}
+
 // UserID 从 gin.Context 取当前登录用户 ID
 // 必须在 Auth 中间件之后调用
 func UserID(c *gin.Context) int64 {

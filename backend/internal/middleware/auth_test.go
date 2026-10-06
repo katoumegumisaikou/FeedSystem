@@ -162,3 +162,48 @@ func TestAuth_登出黑名单(t *testing.T) {
 		assert.Equal(t, http.StatusOK, authCall(r, "").Code)
 	})
 }
+
+// TestInvalidateUserVersion 递增 users.version 后必须能清掉它的缓存。
+//
+// 这是 B21 的回归测试:ChangePassword 递增 version 却没人清缓存,
+// 于是 checkUserVersion 继续读旧值,「旧 token 立刻失效」变成「最长 5 分钟后失效」。
+// 实测当时旧 access_token 仍可用,而同刻旧 refresh_token 已失效
+// (Refresh 直查 DB、不经缓存)—— 同一个 version 值给出两种判定。
+func TestInvalidateUserVersion(t *testing.T) {
+	ctx := t.Context()
+
+	t.Run("删掉已存在的缓存", func(t *testing.T) {
+		rdb, mr := authTestRedis(t)
+		require.NoError(t, rdb.Set(ctx, userVersionKey(7), int64(3), time.Minute).Err())
+		require.True(t, mr.Exists(userVersionKey(7)), "前置条件:缓存应已写入")
+
+		InvalidateUserVersion(ctx, rdb, 7)
+
+		assert.False(t, mr.Exists(userVersionKey(7)), "缓存必须被删掉")
+	})
+
+	t.Run("只删目标用户", func(t *testing.T) {
+		// key 里必须带 userID,否则会顺手清掉别人的 —— 而别人的 version 没变,
+		// 清掉只是白回源一次 DB,不致命,但这种「误伤」掩盖了真正的拼 key 错误
+		rdb, mr := authTestRedis(t)
+		require.NoError(t, rdb.Set(ctx, userVersionKey(7), int64(3), time.Minute).Err())
+		require.NoError(t, rdb.Set(ctx, userVersionKey(8), int64(5), time.Minute).Err())
+
+		InvalidateUserVersion(ctx, rdb, 7)
+
+		assert.False(t, mr.Exists(userVersionKey(7)))
+		assert.True(t, mr.Exists(userVersionKey(8)), "不该碰别的用户")
+	})
+
+	t.Run("key不存在时不报错", func(t *testing.T) {
+		// Redis 对不存在的 key 执行 DEL 返回 0、不报错 —— 这正是「拼错 key」
+		// 会静默的原因,所以幂等性得单独确认
+		rdb, _ := authTestRedis(t)
+		assert.NotPanics(t, func() { InvalidateUserVersion(ctx, rdb, 999) })
+	})
+
+	t.Run("rdb为nil不panic", func(t *testing.T) {
+		// main.go 的既有路径:Redis 连不上时 rdb 就是 nil
+		assert.NotPanics(t, func() { InvalidateUserVersion(ctx, nil, 7) })
+	})
+}

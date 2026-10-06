@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -615,6 +616,10 @@ func TestChangePassword(t *testing.T) {
 		phone := testPhone
 		code := issue(t, svc)
 
+		// 先造出「version 已进缓存」这个现场 —— 真实线上必然如此:
+		// 用户改密前一定用过 App,任意一次鉴权请求都会把这个 key 填上
+		require.NoError(t, mr.Set("feed:user:version:"+strconv.FormatInt(u.ID, 10), strconv.FormatInt(u.Version, 10)))
+
 		resp, err := svc.ChangePassword(context.Background(), ChangePasswordReq{
 			Phone: phone, Password: "NewPassw0rd!", SmsCode: code,
 		})
@@ -629,6 +634,32 @@ func TestChangePassword(t *testing.T) {
 		assert.False(t, password.Verify(stored.Password, testPassword))
 
 		assert.False(t, mr.Exists("feed:sms:"+phone), "验证码校验通过后必须删除")
+
+		// ★ version 缓存必须被删。不删的话 middleware.checkUserVersion 会继续读
+		// 缓存里的旧值,「旧 token 立刻失效」实际变成「最长 versionCacheTTL 后失效」
+		assert.False(t, mr.Exists("feed:user:version:"+strconv.FormatInt(u.ID, 10)),
+			"改密后必须清掉 version 缓存,否则旧 access_token 还能用 5 分钟")
+	})
+
+	t.Run("更新用户失败_版本号与缓存都不动", func(t *testing.T) {
+		// 对照组:失效必须排在 Update 成功之后。若写库失败却清了缓存,
+		// 缓存虽然被清但 version 没变 —— 下次读回原值,行为上无害,
+		// 但「清缓存」与「version 已递增」被解耦了,以后改动容易踩空
+		svc, repo, mr := newSvc(t)
+		u := seedUser(t, repo)
+		code := issue(t, svc)
+		repo.failWith("Update", errors.New("db down"))
+
+		key := "feed:user:version:" + strconv.FormatInt(u.ID, 10)
+		require.NoError(t, mr.Set(key, strconv.FormatInt(u.Version, 10)))
+
+		_, err := svc.ChangePassword(context.Background(), ChangePasswordReq{
+			Phone: testPhone, Password: "NewPassw0rd!", SmsCode: code,
+		})
+		assertCode(t, err, errs.ErrInternal)
+
+		assert.Equal(t, u.Version, repo.get(u.ID).Version, "失败时不该递增")
+		assert.True(t, mr.Exists(key), "写库失败时不该动缓存")
 	})
 
 	t.Run("验证码错误_密码不变", func(t *testing.T) {
