@@ -181,6 +181,19 @@ const CoverURLPrefix = "/covers"
 // CoverStorageDir 封面存储根目录,与 CoverURLPrefix 一一对应
 const CoverStorageDir = "storage/covers"
 
+// maxCoverSize 封面上限 10 MiB,与头像同档。封面是列表页首屏就加载的图,
+// 放开只会让用户的流量和前端首屏一起变差
+const maxCoverSize = 10 << 20
+
+// allowedCoverMIME 封面格式白名单,与头像一致(在魔数判定之后过滤)。
+// 不收 SVG:它能内嵌 <script>,当 img src 之外的场景(新窗口打开)会变成 XSS 面
+var allowedCoverMIME = map[string]bool{
+	filetype.MIMEJPEG: true,
+	filetype.MIMEPNG:  true,
+	filetype.MIMEGIF:  true,
+	filetype.MIMEWebP: true,
+}
+
 // chunkStorageDir 分片上传的临时根目录,每个会话一个子目录。
 // 不能借用系统 /tmp:多数机器的 /tmp 是 tmpfs(内存盘),大视频会吃光内存,
 // 而且跨文件系统 rename 会返回 EXDEV
@@ -536,6 +549,92 @@ func (s *VideoService) CompleteChunkUpload(ctx context.Context, req CompleteChun
 // 或外站地址;顺手挡掉 "..",免得拼出目录穿越
 func validCoverURL(u string) bool {
 	return strings.HasPrefix(u, CoverURLPrefix+"/") && !strings.Contains(u, "..")
+}
+
+// UploadCover 上传封面文件(POST /videos/:id/cover)。照头像上传那套写,差别只有三点:
+// 归属校验(必须是视频作者)、存储目录按 videoID 分、以及不回写库。
+//
+// 为什么不在这里直接写 videos.cover_url:上传与「哪条视频用它」是两件事 ——
+// 同一张图可能先传好、用户再决定给哪条视频;而且写库要顺带失效详情缓存,
+// 那是编辑接口的职责。所以这里只落文件并返回 URL,由客户端调 PUT /videos/:id 应用。
+// 代价是可能留下没被任何视频引用的孤儿文件,与 chunkStorageDir 的孤儿同属待清理范畴。
+func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, fileheader *multipart.FileHeader) (*UploadCoverResp, error) {
+	// 复用编辑接口的归属校验:不是作者 403、视频不存在 404,
+	// 且已下架的也不允许换封面(与 UpdateVideo 的口径一致)
+	video, err := s.loadOwnedVideo(ctx, videoID, userID)
+	if err != nil {
+		return nil, err
+	}
+	if video.Status == StatusRemoved {
+		return nil, errs.ErrConflict.WithMsg("视频已下架,不能更换封面")
+	}
+
+	if fileheader.Size <= 0 || fileheader.Size > maxCoverSize {
+		return nil, errs.ErrInvalidParam.WithMsg("封面文件不能为空,且大小不能超过 10MB")
+	}
+
+	multiFile, err := fileheader.Open()
+	if err != nil {
+		slog.ErrorContext(ctx, "打开上传文件失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("读取上传文件失败")
+	}
+	defer multiFile.Close()
+
+	// 后缀和 Content-Type 都由客户端提供,只能用文件头魔数判真实类型
+	header := make([]byte, filetype.HeaderSize)
+	n, readErr := io.ReadFull(multiFile, header)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		slog.ErrorContext(ctx, "读取文件头失败", "video_id", videoID, "user_id", userID, "err", readErr)
+		return nil, errs.ErrInternal.WithMsg("读取上传文件失败")
+	}
+	mime, ok := filetype.DetectImage(header[:n])
+	if !ok || !allowedCoverMIME[mime] {
+		return nil, errs.ErrInvalidParam.WithMsg("封面只支持 JPG / PNG / GIF / WebP 格式")
+	}
+	ext, ok := filetype.ExtForMIME(mime)
+	if !ok {
+		return nil, errs.ErrInvalidParam.WithMsg("封面只支持 JPG / PNG / GIF / WebP 格式")
+	}
+	// 读魔数移动了文件偏移,保存前必须 Seek 回开头,否则丢失前 12 字节
+	if _, err := multiFile.Seek(0, io.SeekStart); err != nil {
+		slog.ErrorContext(ctx, "重置文件偏移失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("读取上传文件失败")
+	}
+
+	// 按 videoID 分目录,和视频/头像同一套布局。目录必须 0o755 带 x 位才能进入
+	dir := filepath.Join(CoverStorageDir, strconv.FormatInt(videoID, 10))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.ErrorContext(ctx, "创建封面目录失败", "video_id", videoID, "dir", dir, "err", err)
+		return nil, errs.ErrInternal.WithMsg("保存封面失败")
+	}
+
+	// 文件名用 uuid,不用客户端给的名字:避免路径穿越、避免同名覆盖、也避免
+	// 「文件名里带别人的昵称」这类隐私泄漏。扩理由魔数决定,不信客户端给的后缀
+	fileName := uuid.NewString() + ext
+	filePath := filepath.Join(dir, fileName)
+
+	osFile, err := os.Create(filePath)
+	if err != nil {
+		slog.ErrorContext(ctx, "创建封面文件失败", "video_id", videoID, "path", filePath, "err", err)
+		return nil, errs.ErrInternal.WithMsg("保存封面失败")
+	}
+	// Close 的错误只能记日志:defer 到函数返回才执行,挡不住「返回了 URL 却写没落稳」
+	defer func() {
+		if cerr := osFile.Close(); cerr != nil {
+			slog.ErrorContext(ctx, "关闭封面文件失败", "video_id", videoID, "path", filePath, "err", cerr)
+		}
+	}()
+
+	if _, err := io.Copy(osFile, multiFile); err != nil {
+		_ = os.Remove(filePath) // 写盘失败,清掉半个文件
+		slog.ErrorContext(ctx, "写入封面文件失败", "video_id", videoID, "path", filePath, "err", err)
+		return nil, errs.ErrInternal.WithMsg("保存封面失败")
+	}
+
+	// 存对外 URL(相对路径,前端同源;生产由 Nginx 反代到存储目录)。
+	// 拼出来的形式与 validCoverURL 的允许范围一致,PUT /videos/:id 能原样收下
+	coverURL := CoverURLPrefix + "/" + strconv.FormatInt(videoID, 10) + "/" + fileName
+	return &UploadCoverResp{CoverURL: coverURL}, nil
 }
 
 // findVideo 取视频,不存在返回 404,仓储出错记日志并返回 500

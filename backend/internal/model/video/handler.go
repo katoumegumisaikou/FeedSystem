@@ -281,6 +281,33 @@ func (v *VideoHandler) DeleteVideo(c *gin.Context) {
 	response.OK(c, nil)
 }
 
+func (v *VideoHandler) UploadCover(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	// 必须先判 err 再用 fileheader:FormFile 失败返回 nil,
+	// 先访问 fileheader.Size 会 panic
+	fileheader, err := c.FormFile("cover")
+	if err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("请选择要上传的封面文件"))
+		return
+	}
+
+	resp, err := v.svc.UploadCover(c.Request.Context(), videoID, userID, fileheader)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
 // ListUserVideos 某人的视频列表(GET /users/:id/videos)。
 // 路径里的 :id 是作者 ID 不是视频 ID,所以不能用 videoIDParam(它的报错文案写死了「视频 ID」)
 func (v *VideoHandler) ListUserVideos(c *gin.Context) {

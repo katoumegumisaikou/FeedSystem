@@ -136,8 +136,10 @@ func main() {
 		middleware.Auth(db, rdb),
 		video.PlayAccess(videoRepo, rdb),
 	).Static("", video.VideoStorageDir)
-	// 封面公开访问: /covers/{fileName}。
-	// 目录现在还是空的 —— 封面上传接口尚未实现,挂在这里是为了让入库的 cover_url 有落点
+	// 封面公开访问 /covers/{videoID}/{fileName}。
+	//
+	// 与视频不同,封面不设门禁:它出现在列表页首屏,游客也要能直接加载,没有
+	// Auth 软鉴权与状态判定的必要。上传入口在 POST /videos/:id/cover(仅作者)
 	r.Static(video.CoverURLPrefix, video.CoverStorageDir)
 
 	v1 := r.Group("/api/v1")

@@ -1,10 +1,15 @@
 package video
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"mime/multipart"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"feed-system/internal/pkg/errs"
+	"feed-system/internal/util/filetype"
 )
 
 func TestValidCoverURL(t *testing.T) {
@@ -1216,6 +1222,120 @@ func TestSetLikeStatusesDegrades(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, resp.IsLike, "查询成功时必须填上点赞态")
 		assert.True(t, *resp.IsLike)
+	})
+}
+
+// coverHeaderWith 造一个带内容的 *multipart.FileHeader,字段名 "cover"。
+// content 是未导出字段,只能靠 multipart 往返生成 —— 与头像上传的测试同一手法
+func coverHeaderWith(t *testing.T, filename string, content []byte) *multipart.FileHeader {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("cover", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	form, err := multipart.NewReader(&buf, w.Boundary()).ReadForm(32 << 20)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = form.RemoveAll() })
+
+	fhs := form.File["cover"]
+	require.Len(t, fhs, 1)
+	return fhs[0]
+}
+
+// TestUploadCover 封面上传。与头像上传同构,差别在归属校验与「不回写库、只返回 URL」
+func TestUploadCover(t *testing.T) {
+	ctx := context.Background()
+	const other int64 = 999
+	// 用一个不可能存在的 videoID,好断言「被拒时没在磁盘上留下目录」
+	const ghostVideoID = 999999001
+
+	// 造「魔数合法 + 填充」的样本,长度达到 HeaderSize
+	imageSample := func(magic []byte) []byte {
+		b := make([]byte, filetype.HeaderSize+8)
+		copy(b, magic)
+		return b
+	}
+	png := imageSample([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+
+	t.Run("视频不存在 404,且不落盘", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := coverHeaderWith(t, "c.png", png)
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, ghostVideoID, testUserID, fh)), errs.ErrNotFound)
+	})
+
+	t.Run("不是作者 403", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := coverHeaderWith(t, "c.png", png)
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, other, fh)), errs.ErrForbidden)
+	})
+
+	t.Run("未登录 401", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := coverHeaderWith(t, "c.png", png)
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, 0, fh)), errs.ErrUnauthorized)
+	})
+
+	t.Run("已下架不能换封面", func(t *testing.T) {
+		v := publishedVideo()
+		v.Status = StatusRemoved
+		svc, _ := newTestService(v)
+		fh := coverHeaderWith(t, "c.png", png)
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, fh)), errs.ErrConflict)
+	})
+
+	t.Run("空文件被拒", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		// Size 是导出字段可直接构造;大小校验排在 Open 之前,无需 content
+		fh := &multipart.FileHeader{Filename: "c.png", Size: 0}
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, fh)), errs.ErrInvalidParam)
+	})
+
+	t.Run("超过10MiB被拒", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := &multipart.FileHeader{Filename: "c.png", Size: maxCoverSize + 1}
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, fh)), errs.ErrInvalidParam)
+	})
+
+	t.Run("伪装成图片的HTML被拒", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		// 文件名带 .html,但类型由魔数判定,内容不是图片 → 拒
+		fh := coverHeaderWith(t, "evil.html", []byte("<!DOCTYPE html><html><script>alert(1)</script>"))
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, fh)), errs.ErrInvalidParam)
+	})
+
+	t.Run("内容不足12字节且无魔数_被拒", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := coverHeaderWith(t, "c.png", []byte{0x01, 0x02, 0x03})
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, fh)), errs.ErrInvalidParam)
+	})
+
+	t.Run("合法PNG:落盘并返回可被 validCoverURL 接受的 URL", func(t *testing.T) {
+		svc, _ := newTestService(publishedVideo())
+		fh := coverHeaderWith(t, "my cover.png", png)
+
+		resp, err := svc.UploadCover(ctx, 1, testUserID, fh)
+		require.NoError(t, err)
+
+		// 文件名必须由服务端生成:不能用客户端给的 "my cover.png"(空格、可穿越、可覆盖)
+		assert.NotContains(t, resp.CoverURL, "my cover.png", "不该沿用客户端文件名")
+		assert.True(t, strings.HasPrefix(resp.CoverURL, CoverURLPrefix+"/1/"),
+			"URL 应是 /covers/<videoID>/<uuid>.png 形式,实际 %s", resp.CoverURL)
+		assert.True(t, strings.HasSuffix(resp.CoverURL, ".png"), "后缀应由魔数判定为 .png")
+
+		// 拼出来的 URL 必须能原样喂给 PUT /videos/:id —— 两边口径必须一致
+		assert.True(t, validCoverURL(resp.CoverURL), "返回的 URL 必须通过 validCoverURL")
+
+		// 文件真的落盘了
+		diskPath := filepath.Join(CoverStorageDir, "1", filepath.Base(resp.CoverURL))
+		info, statErr := os.Stat(diskPath)
+		require.NoError(t, statErr, "封面文件应该真的写到了 %s", diskPath)
+		assert.EqualValues(t, len(png), info.Size(), "落盘大小应与上传内容一致")
+		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
 	})
 }
 

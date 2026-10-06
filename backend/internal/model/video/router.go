@@ -86,6 +86,10 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 		priv.PUT("/:id", h.UpdateVideo)                     // 编辑标题 / 简介 / 封面
 		priv.POST("/:id/publish", h.PublishVideo)           // 草稿 → 已发布
 		priv.DELETE("/:id", h.DeleteVideo)                  // 软删除(幂等)
+		// 封面上传与分片上传同组(都受 uploadIPLimit/uploadUserLimit 管)。
+		// 不单独建组:封面也是「为这条视频上传一个文件」,与 chunk/complete 同一类动作,
+		// 阈值虽是为 1GiB 分片定的,但 10MB 的封面在这个桶里只占一小部分,不必再开一个
+		priv.POST("/:id/cover", h.UploadCover) // 上传封面文件(需 author 身份)
 	}
 
 	// ========== 互动(点赞,强制登录) ==========

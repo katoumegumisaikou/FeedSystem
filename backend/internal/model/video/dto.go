@@ -55,6 +55,15 @@ type LikeResp struct {
 	LikesCount int64 `json:"likes_count"` // 操作后的点赞总数
 }
 
+// UploadCoverResp 封面上传的结果。
+//
+// 回 cover_url 而不是让客户端自己拼:文件名是服务端生成的(uuid + 由魔数判出的后缀),
+// 客户端无从得知;拿到它之后调 PUT /videos/:id 把它写进封面字段,
+// 与完整上传流程「返回 video_id、再调编辑接口补标题封面」同一套分工
+type UploadCoverResp struct {
+	CoverURL string `json:"cover_url"`
+}
+
 // ListUserVideosReq 某人的视频列表查询参数(GET /users/:id/videos)。
 //
 // 游标是复合的 (created_at, video_id)。只带时间戳的话,同一微秒上传的两条没有
