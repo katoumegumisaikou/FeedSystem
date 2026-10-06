@@ -453,6 +453,19 @@ func TestUpdateVideo(t *testing.T) {
 		assert.False(t, wrote, "留空就不该把 cover_url 放进更新列")
 	})
 
+	// 上传接口现在自己写库了,所以这条路径只服务一个场景:
+	// 前端已先传好图、但视频还没建出来,等保存草稿时把 URL 一并提交
+	t.Run("显式传 cover_url 时写进更新列并回显", func(t *testing.T) {
+		svc, repo := newTestService(draftVideo())
+
+		resp, err := svc.UpdateVideo(ctx, 1, testUserID, UpdateVideoReq{
+			Title: "t", CoverURL: "/covers/1/new.png",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "/covers/1/new.png", resp.CoverURL)
+		assert.Equal(t, "/covers/1/new.png", repo.lastFields["cover_url"])
+	})
+
 	t.Run("封面不是站内路径被拒", func(t *testing.T) {
 		svc, _ := newTestService(draftVideo())
 		for _, bad := range []string{"http://evil.com/x.png", "javascript:alert(1)", "/covers/../secret"} {
@@ -1337,6 +1350,90 @@ func TestUploadCover(t *testing.T) {
 		assert.EqualValues(t, len(png), info.Size(), "落盘大小应与上传内容一致")
 		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
 	})
+
+	t.Run("上传即写库:cover_url 进更新列,无需再调编辑接口", func(t *testing.T) {
+		svc, repo := newTestService(publishedVideo())
+		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
+
+		resp, err := svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))
+		require.NoError(t, err)
+
+		assert.Equal(t, resp.CoverURL, repo.lastFields["cover_url"],
+			"返回的 URL 必须原样写进 cover_url 列,否则前端还得再调一次 PUT")
+		// 只写这一列:上传封面不该顺带动到标题、简介
+		assert.Len(t, repo.lastFields, 1, "只该更新 cover_url 一列,实际 %v", repo.lastFields)
+
+		// 目录里正好一个文件 —— 落盘与写库都在同一次调用里完成
+		entries, readErr := os.ReadDir(filepath.Join(CoverStorageDir, "1"))
+		require.NoError(t, readErr)
+		assert.Len(t, entries, 1, "合法上传只该留下一个文件")
+	})
+
+	t.Run("写库失败:回滚已落的文件,不留孤儿", func(t *testing.T) {
+		svc, repo := newTestService(publishedVideo())
+		repo.updateErr = errors.New("db down")
+		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
+
+		assertCode(t, errsOrNil(svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))),
+			errs.ErrInternal)
+
+		// 文件已经写出去了。留着它的话,客户端看到的是一次失败,它无从知道
+		// 服务器上多了一个永远不会被引用的文件 —— 所以必须由服务端自己回滚
+		entries, readErr := os.ReadDir(filepath.Join(CoverStorageDir, "1"))
+		require.NoError(t, readErr, "目录应该已经建出来了,说明确实走到了写盘这一步")
+		assert.Empty(t, entries, "写库失败后不该留下孤儿文件")
+	})
+
+	t.Run("上传后详情立刻是新封面(缓存已失效)", func(t *testing.T) {
+		svc, repo, _ := newCachedTestService(t, publishedVideo())
+		t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
+
+		// 先把带旧封面的实体灌进详情缓存
+		repo.videos[1].CoverURL = "/covers/1/old.png"
+		_, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+
+		resp, err := svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))
+		require.NoError(t, err)
+
+		detail, err := svc.GetVideoDetail(ctx, 1, 0)
+		require.NoError(t, err)
+		assert.Equal(t, resp.CoverURL, detail.CoverURL,
+			"不失效详情缓存的话,这里读到的还是 old.png")
+	})
+}
+
+// TestCoverURLReachesVideoDetail 封面从上传到详情返回的完整链路:
+// POST /videos/:id/cover → GET /videos/:id / GET /users/:id/videos 读回。
+//
+// 三段分属三个接口,任何一段改了格式(前缀、字段名、写库的那一列)链路都会断 ——
+// 而且断在运行时。这不是单个接口的内部一致性,是接口之间的契约,所以要跨接口锁一次。
+func TestCoverURLReachesVideoDetail(t *testing.T) {
+	ctx := context.Background()
+	svc, repo := newTestService(publishedVideo())
+
+	// 上传一次就该生效 —— 中间不再有「再调 PUT 应用」这一步
+	png := make([]byte, filetype.HeaderSize+8)
+	copy(png, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A})
+	up, err := svc.UploadCover(ctx, 1, testUserID, coverHeaderWith(t, "c.png", png))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join(CoverStorageDir, "1")) })
+
+	// 必须断言「写进更新列了没」,而不是断言 repo.videos[1].CoverURL ——
+	// fake 把同一个 *Video 指针交出去,任何原地修改都会连带改到「库里」那份,
+	// 于是「漏写 cover_url 列」这种 bug 会被假象掩盖。真实仓储返回的是 GORM 新填的结构体
+	assert.Equal(t, up.CoverURL, repo.lastFields["cover_url"], "cover_url 必须进更新列")
+
+	// 详情:游客也看得到
+	detail, err := svc.GetVideoDetail(ctx, 1, 0)
+	require.NoError(t, err)
+	assert.Equal(t, up.CoverURL, detail.CoverURL, "详情必须返回封面地址")
+
+	// 列表走的是同一个 toVideoResp,顺带确认没有第二条拼装路径
+	list, err := svc.ListUserVideos(ctx, testUserID, testUserID, ListUserVideosReq{})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	assert.Equal(t, up.CoverURL, list.Items[0].CoverURL, "列表卡片也要带封面")
 }
 
 // TestListUserVideos 一个接口两种可见范围:别人只看已发布,作者看自己还含草稿

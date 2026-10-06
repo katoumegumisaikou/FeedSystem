@@ -521,7 +521,7 @@ func (s *VideoService) CompleteChunkUpload(ctx context.Context, req CompleteChun
 		AvatarURL: avatarURL,
 		Title:     decl.Filename, // 标题先用原始文件名,发布时再改
 		PlayURL:   VideoURLPrefix + "/" + strconv.FormatInt(userID, 10) + "/" + finalName,
-		CoverURL:  "",          // 封面是另一个文件,走编辑接口补
+		CoverURL:  "",          // 封面是另一个文件,由 POST /videos/:id/cover 单独补
 		Status:    StatusDraft, // 草稿:还没编辑标题和封面
 	}
 	if err := s.videorepo.CreateVideo(ctx, video); err != nil {
@@ -551,20 +551,31 @@ func validCoverURL(u string) bool {
 	return strings.HasPrefix(u, CoverURLPrefix+"/") && !strings.Contains(u, "..")
 }
 
-// UploadCover 上传封面文件(POST /videos/:id/cover)。照头像上传那套写,差别只有三点:
-// 归属校验(必须是视频作者)、存储目录按 videoID 分、以及不回写库。
+// UploadCover 上传封面文件并直接应用到该视频(POST /videos/:id/cover)。
+// 照头像上传那套写,差别只有两点:归属与状态校验、存储目录按 videoID 分。
 //
-// 为什么不在这里直接写 videos.cover_url:上传与「哪条视频用它」是两件事 ——
-// 同一张图可能先传好、用户再决定给哪条视频;而且写库要顺带失效详情缓存,
-// 那是编辑接口的职责。所以这里只落文件并返回 URL,由客户端调 PUT /videos/:id 应用。
-// 代价是可能留下没被任何视频引用的孤儿文件,与 chunkStorageDir 的孤儿同属待清理范畴。
+// 与「先上传拿 URL、再由客户端调 PUT /videos/:id 应用」相比,这里把两步并成一步:
+// 界面上换封面就是一个动作,拆成两次请求会凭空多出「上传成功但应用失败」的中间态 ——
+// 一张谁也不引用的孤儿图,外加一个没变的 cover_url,而前端拿到的是两个都成功、
+// 合起来却无效的结果。合成一步后,失败就是整体失败,客户端不必自己判断要不要补第二次请求。
+//
+// 顺序必须是「先落文件、再写库」,两个方向都错:
+// 反过来先写库,一旦写库成功而落盘失败,数据库里就留下一个指向不存在文件的 cover_url,
+// 列表页当场图裂,而且没有任何东西会去修它。所以先让文件真实存在,再让数据库指向它;
+// 写库失败就把刚落的文件删掉,对外表现为一次干净的整体失败。
 func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, fileheader *multipart.FileHeader) (*UploadCoverResp, error) {
-	// 复用编辑接口的归属校验:不是作者 403、视频不存在 404,
-	// 且已下架的也不允许换封面(与 UpdateVideo 的口径一致)
+	// 归属与状态:不是作者 403、视频不存在 404、未登录 401、已下架 409。
+	// 与 UpdateVideo 完全一致 —— 这一步就是在改那条视频的 cover_url 字段
 	video, err := s.loadOwnedVideo(ctx, videoID, userID)
 	if err != nil {
 		return nil, err
 	}
+	// 下架是运营决定,不该被作者从上传接口绕过去换掉封面(与 UpdateVideo 同一口径)。
+	//
+	// 这里判完到下面写库之间有个窗口:运营恰好在这期间下架,封面仍会被写上去。
+	// 不为此把状态判定塞进 UPDATE 的 WHERE 里,是因为代价可以忽略 ——
+	// 已下架的视频在任何列表和详情里都不可见,给一条看不见的视频换个封面不影响任何人的观感。
+	// 与 UploadChunk 里「合并中那段空窗挡不住」是同一类有意接受的取舍
 	if video.Status == StatusRemoved {
 		return nil, errs.ErrConflict.WithMsg("视频已下架,不能更换封面")
 	}
@@ -609,31 +620,48 @@ func (s *VideoService) UploadCover(ctx context.Context, videoID, userID int64, f
 	}
 
 	// 文件名用 uuid,不用客户端给的名字:避免路径穿越、避免同名覆盖、也避免
-	// 「文件名里带别人的昵称」这类隐私泄漏。扩理由魔数决定,不信客户端给的后缀
+	// 「文件名里带别人的昵称」这类隐私泄漏。扩展名由魔数决定,不信客户端给的后缀
 	fileName := uuid.NewString() + ext
 	filePath := filepath.Join(dir, fileName)
 
 	osFile, err := os.Create(filePath)
 	if err != nil {
-		slog.ErrorContext(ctx, "创建封面文件失败", "video_id", videoID, "path", filePath, "err", err)
+		slog.ErrorContext(ctx, "创建封面文件失败", "video_id", videoID, "user_id", userID, "path", filePath, "err", err)
 		return nil, errs.ErrInternal.WithMsg("保存封面失败")
 	}
-	// Close 的错误只能记日志:defer 到函数返回才执行,挡不住「返回了 URL 却写没落稳」
-	defer func() {
-		if cerr := osFile.Close(); cerr != nil {
-			slog.ErrorContext(ctx, "关闭封面文件失败", "video_id", videoID, "path", filePath, "err", cerr)
-		}
-	}()
 
 	if _, err := io.Copy(osFile, multiFile); err != nil {
+		_ = osFile.Close()
 		_ = os.Remove(filePath) // 写盘失败,清掉半个文件
 		slog.ErrorContext(ctx, "写入封面文件失败", "video_id", videoID, "path", filePath, "err", err)
 		return nil, errs.ErrInternal.WithMsg("保存封面失败")
 	}
 
+	// 显式 Close,不用 defer:close 可能携带延迟写入错误,而下面就要把这条路径写进数据库。
+	// 放过它等于让数据库指向一个没落稳的文件 —— 与 concatChunks 里
+	// 「close 的错误必须在 rename 之前判」是同一条理由
+	if err := osFile.Close(); err != nil {
+		_ = os.Remove(filePath)
+		slog.ErrorContext(ctx, "关闭封面文件失败", "video_id", videoID, "path", filePath, "err", err)
+		return nil, errs.ErrInternal.WithMsg("保存封面失败")
+	}
+
 	// 存对外 URL(相对路径,前端同源;生产由 Nginx 反代到存储目录)。
-	// 拼出来的形式与 validCoverURL 的允许范围一致,PUT /videos/:id 能原样收下
+	// 这个形式与 validCoverURL 的允许范围一致,所以它也能被 PUT /videos/:id 原样收下 ——
+	// 前端想在保存草稿时一并提交封面,那条路径依然可用
 	coverURL := CoverURLPrefix + "/" + strconv.FormatInt(videoID, 10) + "/" + fileName
+
+	// 写库。失败就删掉刚落的文件:留着的话它永远不会被任何视频引用,
+	// 而客户端看到的是一次失败 —— 它无从知道服务器上多了一个文件要清理
+	if err := s.videorepo.UpdateVideoFields(ctx, videoID, map[string]any{"cover_url": coverURL}); err != nil {
+		_ = os.Remove(filePath)
+		slog.ErrorContext(ctx, "写入封面字段失败", "video_id", videoID, "user_id", userID, "path", filePath, "err", err)
+		return nil, errs.ErrInternal.WithMsg("保存封面失败")
+	}
+	// 详情缓存里存的是 Video 实体,带着旧的 cover_url。不失效就会「换完封面刷新还是旧图」,
+	// 直到 TTL 过期 —— 与 UpdateVideo 同一条理由,也要排在写库之后
+	s.invalidateVideoDetail(ctx, videoID)
+
 	return &UploadCoverResp{CoverURL: coverURL}, nil
 }
 

@@ -57,9 +57,12 @@ type LikeResp struct {
 
 // UploadCoverResp 封面上传的结果。
 //
-// 回 cover_url 而不是让客户端自己拼:文件名是服务端生成的(uuid + 由魔数判出的后缀),
-// 客户端无从得知;拿到它之后调 PUT /videos/:id 把它写进封面字段,
-// 与完整上传流程「返回 video_id、再调编辑接口补标题封面」同一套分工
+// 上传接口自己就把 cover_url 写进了视频 —— 返回它只是给客户端一个回显,
+// 不是让它再调一次编辑接口。回的是服务端生成的地址而不是让客户端自己拼:
+// 文件名是 uuid + 由魔数判出的后缀,客户端无从得知
+//
+// 仍需 PUT /videos/:id 的场景只剩一个:前端已经先传了图、但视频还没建出来,
+// 得等保存草稿时再一并提交
 type UploadCoverResp struct {
 	CoverURL string `json:"cover_url"`
 }
