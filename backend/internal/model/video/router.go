@@ -31,7 +31,7 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 	// 带了合法 token 就注入 userID,没带直接放行。这样作者能用同一个接口看到
 	// 自己的草稿,游客只能看到已发布的 —— 可见范围由 service 判定
 	pub := rg.Group("/videos",
-		middleware.IPRateLimiter(rdb, detailIPLimit),
+		middleware.IPRateLimiter(rdb, "video:read", detailIPLimit),
 		middleware.Auth(db, rdb),
 	)
 	{
@@ -44,8 +44,11 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 	// account 那边。软鉴权:游客只看得到已发布,作者本人额外能看到草稿
 	//
 	// 与 account 的 GET /users/:id 不冲突:通配段名都是 :id,静态子段 videos 独立
+	// 与公开组共用 video:read 这个 scope,是**故意**的:两者是同一套策略
+	// (公开读 + 防按 ID 遍历),而且浏览一个作者主页就是「1 次列表 + n 次详情」,
+	// 本来就该从同一个预算里扣。共用一个 scope 时参数必须相同 —— 这里都是 detailIPLimit
 	userVideos := rg.Group("/users",
-		middleware.IPRateLimiter(rdb, detailIPLimit),
+		middleware.IPRateLimiter(rdb, "video:read", detailIPLimit),
 		middleware.Auth(db, rdb),
 	)
 	userVideos.GET("/:id/videos", h.ListUserVideos)
@@ -58,9 +61,9 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 	// 注册时直接 panic,而且那组在根路径、不在 /api/v1 下
 	hist := rg.Group("/videos",
 		middleware.SetSensitive(),
-		middleware.IPRateLimiter(rdb, historyIPLimit),
+		middleware.IPRateLimiter(rdb, "video:history", historyIPLimit),
 		middleware.Auth(db, rdb),
-		middleware.UserRateLimiter(rdb, historyUserLimit),
+		middleware.UserRateLimiter(rdb, "video:history", historyUserLimit),
 	)
 	{
 		hist.GET("/history", h.ListHistory)
@@ -75,9 +78,9 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 	// 限流顺序不能乱:IP 在最前,UserRateLimiter 依赖 Auth 注入的 userID
 	priv := rg.Group("/videos",
 		middleware.SetSensitive(),
-		middleware.IPRateLimiter(rdb, uploadIPLimit),
+		middleware.IPRateLimiter(rdb, "video:upload", uploadIPLimit),
 		middleware.Auth(db, rdb),
-		middleware.UserRateLimiter(rdb, uploadUserLimit),
+		middleware.UserRateLimiter(rdb, "video:upload", uploadUserLimit),
 	)
 	{
 		priv.POST("/chunk/init", h.InitChunkUpload)         // 初始化上传,拿 upload_id
@@ -100,9 +103,9 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 	// 通配段名必须一致(都用 :id),静态子段 like/play 可以并存,不冲突
 	like := rg.Group("/videos",
 		middleware.SetSensitive(),
-		middleware.IPRateLimiter(rdb, likeIPLimit),
+		middleware.IPRateLimiter(rdb, "video:like", likeIPLimit),
 		middleware.Auth(db, rdb),
-		middleware.UserRateLimiter(rdb, likeUserLimit),
+		middleware.UserRateLimiter(rdb, "video:like", likeUserLimit),
 	)
 	{
 		like.POST("/:id/like", h.Like)     // 点赞(幂等)

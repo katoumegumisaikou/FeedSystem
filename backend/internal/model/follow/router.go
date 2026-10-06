@@ -31,9 +31,9 @@ func RegisterRouter(rg *gin.RouterGroup, h *FollowHandler, db *gorm.DB, rdb *red
 	// 且两者可以共存,所以 /users/me/followees 与 /users/:id 不冲突
 	priv := rg.Group("/users",
 		middleware.SetSensitive(),
-		middleware.IPRateLimiter(rdb, followIPLimit),
+		middleware.IPRateLimiter(rdb, "follow:relation", followIPLimit),
 		middleware.Auth(db, rdb),
-		middleware.UserRateLimiter(rdb, followUserLimit),
+		middleware.UserRateLimiter(rdb, "follow:relation", followUserLimit),
 	)
 	{
 		priv.POST("/:id/follow", h.Follow)     // 关注
