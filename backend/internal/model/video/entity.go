@@ -8,12 +8,32 @@ import (
 
 // 视频状态。数值不能重排:DB 列是 SMALLINT,已有数据按当前数值解释,
 // 新增状态一律往后追加,不要插中间
+//
+// 只有「已发布」与「草稿」两个状态有写入路径:前者由 MarkPublished 写,后者由
+// CompleteChunkUpload 建行时写。其余三个都是**预留但入口未实现** —— 读代码时
+// 不要因为见到守卫就以为功能已存在。真库实测里 status 只会出现 1 与 4 两种值。
 const (
 	StatusTranscoding     int8 = iota // 0 转码中(尚未接入转码,当前没有代码写入这个值)
 	StatusPublished                   // 1 已发布
 	StatusTranscodeFailed             // 2 转码失败(同上,预留)
-	StatusRemoved                     // 3 已下架
-	StatusDraft                       // 4 草稿:分片上传完成,但还没编辑标题/封面
+
+	// 3 已下架。**没有任何接口或仓储方法能设置它** —— 运营下架功能未实现。
+	//
+	// 但下游已有 4 处守卫在检查它,所以读代码时会以为这个状态是活的:
+	//   - UpdateVideo   : 已下架不能编辑
+	//   - UploadCover   : 已下架不能换封面
+	//   - visibleTo     : 已下架对所有人不可见(含作者),文件路由与播放上报共用
+	//   - repo 的列表查询: query.Where("status <> ?", StatusRemoved)
+	//
+	// 守卫本身是对的 —— 与其等运营接口做出来再补,不如先把不可变的规则写进读路径。
+	// 但要清楚:**这些分支现在永远不会命中**,它们的测试也都是「用 fake 手工造出
+	// StatusRemoved 才走得通」,不代表真实流量里出现过。
+	//
+	// 做运营接口时唯一要注意:必须与上面四处口径一致,否则会出现「下架了但还能编辑」
+	// 或「下架了文件仍可下载」。
+	StatusRemoved
+
+	StatusDraft // 4 草稿:分片上传完成,但还没编辑标题/封面
 )
 
 // Video 视频。
@@ -44,11 +64,21 @@ type Video struct {
 	// 很旧的 created_at 进入 7 天投递窗口,被 fan-out 脚本当场裁掉
 	PublishedAt *time.Time `gorm:"type:timestamp" json:"published_at,omitempty"`
 
-	Status       int8  `gorm:"not null;default:4" json:"status"` // 状态(0 转码中 / 1 已发布 / 2 转码失败 / 3 已下架 / 4 草稿)
-	PlayCount    int64 `gorm:"not null;default:0" json:"play_count"`
-	LikesCount   int64 `gorm:"not null;default:0" json:"likes_count"`
+	Status     int8  `gorm:"not null;default:4" json:"status"` // 状态(0 转码中 / 1 已发布 / 2 转码失败 / 3 已下架 / 4 草稿)
+	PlayCount  int64 `gorm:"not null;default:0" json:"play_count"`
+	LikesCount int64 `gorm:"not null;default:0" json:"likes_count"`
+
+	// CommentCount 评论数。**评论模块尚未实现,这个值没有任何写入路径,恒为 0**。
+	//
+	// 列、DTO、以及三处映射都已就位(本结构体、video.VideoResp、feed.FeedItem),
+	// 所以 API 响应里会带一个恒为 0 的 comment_count —— 前端拿它显示「0 条评论」
+	// 与真实的「还没有评论功能」是两回事,接前端时注意别把它当成已实现的功能。
+	//
+	// 与 LikesCount / PlayCount 的区别就在这里:后两者都有真实写入路径
+	// (LikeVideo / UnlikeVideo 在事务里自增,ReportPlay 累加),只有它是空壳。
 	CommentCount int64 `gorm:"not null;default:0" json:"comment_count"`
-	Popularity   int64 `gorm:"not null;default:0" json:"popularity"` // 热度
+
+	Popularity int64 `gorm:"not null;default:0" json:"popularity"` // 热度
 }
 
 // PlayRecord 播放流水:每次播放插一条,只增不改。

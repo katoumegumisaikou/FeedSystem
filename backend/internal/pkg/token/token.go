@@ -17,19 +17,38 @@ const (
 	DefaultRefreshTTL = 30 * 24 * time.Hour
 )
 
-// Claims 自定义 JWT 载荷。Version 在改密码 / 注销时递增,校验时与 DB 中的值比对
+// Claims 自定义 JWT 载荷。
+//
+// Version 是**每用户**的失效开关,只在改密码时递增(见 account.ChangePassword)。
+// 鉴权时由 middleware.checkUserVersion 与 DB 当前值比对,不一致就 401 —— 所以它一次
+// 会让该用户的**所有**设备下线,适合「怀疑账号被盗」那种场景。
+//
+// 登出**不用** version:那是每台设备各自的事,走的是 per-token 黑名单
+// (见 RevokedAccessKey) —— 否则在家退出会把手机也一起踢了。
+//
+// 这两套机制曾经在注释里被混为一谈,写成「version 在改密码 / 注销时递增」,
+// 而实际上登出从未碰过它;照那份注释去读代码会得出错误结论,所以这里写明分工。
 type Claims struct {
 	UserID  int64 `json:"user_id"`
 	Version int64 `json:"version"`
 	jwt.RegisteredClaims
 }
 
-// SignToken 用 HMAC-SHA256 签发 JWT,ttl 决定有效期(access 2h / refresh 30d)
+// SignToken 用 HMAC-SHA256 签发 JWT,ttl 决定有效期(access 2h / refresh 30d)。
+//
+// version 恒为 0,所以只能用于**不需要鉴权**的场景 —— 带上它去访问挂 Auth 的路由,
+// 会被 checkUserVersion 因为没有 matching version 而判 401。
+// 需要鉴权的签发一律走 SignTokenWithVersion
 func SignToken(userID int64, ttl time.Duration) (string, error) {
 	return signToken(userID, 0, ttl)
 }
 
-// SignTokenWithVersion 同 SignToken,但带版本号:改密码 / 注销时递增,旧 token 校验失败
+// SignTokenWithVersion 同 SignToken,但带版本号。
+//
+// 目前唯一的调用方是 account:签发时把 users.version 写进 token,使 middleware 能在
+// 改密码后认出旧 token。version 为 0 时等价于 SignToken —— 但那条路不可用于
+// 需要鉴权的场景:users.version 的 GORM 默认值是 1(非 0),
+// 用 0 签发会被 checkUserVersion 判成不一致而 401
 func SignTokenWithVersion(userID int64, version int64, ttl time.Duration) (string, error) {
 	return signToken(userID, version, ttl)
 }

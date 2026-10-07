@@ -81,7 +81,6 @@ func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProv
 //
 // 之所以先不做:改动落在 ListLatest 里注释最密的那段分页逻辑(score 只到秒、
 // 同秒靠 member 字典序、所以统一再排一次),风险与收益需要单独权衡。
-// 实测与完整分析另见 docs/realdb-findings.md 的 B2。
 const (
 	latestVideosKey    = "feed:video:latest"
 	latestVideosTTL    = time.Hour
