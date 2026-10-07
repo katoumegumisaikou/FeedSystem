@@ -96,27 +96,33 @@ func main() {
 	videoHandler := video.NewVideoHandler(videoSvc)
 
 	// 关注流接线。顺序不能随意换:
-	// fanoutWorker 同时满足 follow 包的三个接缝 —— FollowBackfiller(关注后补拉历史)、
-	// BigVDowngradeReplayer(大V 降级后重放缓存)与 BigVPromoter(大V 升入后回填缓存)
-	// ——所以它必须先建出来,才能喂给 NewFollowService。
+	// feedSvc 要先建出来 —— 它需要清理任务仓储;fanoutWorker 也要它,而 fanoutWorker
+	// 得先存在才能喂给 NewFollowService。
 	followRepo := follow.NewFollowRepository(db)
 	bigvSet := follow.NewBigVSet(followRepo, rdb)
 
 	feedRepo := feed.NewFeedRepository(db)
+	// 读侧惰性清理的任务队列:读路径写、worker 消费。两边用同一个仓储实例。
+	cleanupRepo := feed.NewCleanupRepository(db)
+	// feed 服务:likes 用 videoSvc,关注列表用 followRepo,大V 判定用 bigvSet,
+	// 清理任务队列用 cleanupRepo
+	feedSvc := feed.NewFeedService(feedRepo, rdb, videoSvc, followRepo, bigvSet, cleanupRepo)
+	feedHandler := feed.NewFeedHandler(feedSvc)
+
 	fanoutRepo := feed.NewFanoutRepository(db)
 	// followers 传 followRepo(满足 feed.FollowerLister),bigvs 传 bigvSet(满足
-	// feed.BigVChecker)。feed 不 import follow,靠接口解耦,避免循环依赖
-	fanoutWorker := feed.NewFanoutWorker(fanoutRepo, feedRepo, followRepo, bigvSet, rdb)
-
+	// feed.BigVChecker)。feed 不 import follow,靠接口解耦,避免循环依赖。
+	// 最后一个参数是读侧清理任务的消费端:关注流缓存的过期清理由这个 worker 的循环
+	// 顺带驱动,不为它单独起协程(理由见 feed 包的 runCleanupBatch)
+	fanoutWorker := feed.NewFanoutWorker(fanoutRepo, feedRepo, followRepo, bigvSet, rdb, cleanupRepo)
+	// fanoutWorker 同时满足 follow 包的三个接缝 —— FollowBackfiller(关注后补拉历史)、
+	// BigVDowngradeReplayer(大V 降级后重放缓存)与 BigVPromoter(大V 升入后回填缓存)
 	followSvc := follow.NewFollowService(followRepo, bigvSet, fanoutWorker, fanoutWorker, fanoutWorker)
 	followHandler := follow.NewFollowHandler(followSvc)
 
-	// feed 服务:likes 用 videoSvc,关注列表用 followRepo,大V 判定用 bigvSet
-	feedSvc := feed.NewFeedService(feedRepo, rdb, videoSvc, followRepo, bigvSet)
-	feedHandler := feed.NewFeedHandler(feedSvc)
-
-	// fan-out worker 后台常驻:轮询 fanout_tasks,把新发布视频投进粉丝收件箱。
-	// 用独立的可取消 ctx,退出时先停它再关连接,免得它拿着已关闭的 DB/Redis 继续跑。
+	// 后台常驻协程:轮询 fanout_tasks 把新发布视频投进粉丝收件箱,并顺带清理关注流
+	// 缓存里的过期成员。用独立的可取消 ctx,退出时先停它再关连接,免得它拿着已关闭的
+	// DB/Redis 继续跑。
 	workerCtx, stopWorker := context.WithCancel(context.Background())
 	defer stopWorker()
 	go fanoutWorker.Run(workerCtx)
@@ -175,7 +181,8 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP server 关闭失败: %v", err)
 	}
-	// 先停 fan-out worker(可能正卡在投递里),再关连接,避免它拿着已关闭的资源继续跑
+	// 先停后台协程(fan-out worker 可能正卡在投递或清理里),再关连接,
+	// 避免它拿着已关闭的资源继续跑
 	stopWorker()
 	if rdb != nil {
 		_ = rdb.Close()

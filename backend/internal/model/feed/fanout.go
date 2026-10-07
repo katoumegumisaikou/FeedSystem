@@ -293,13 +293,21 @@ const (
 	bigVInboxCap = 50
 )
 
-// FanoutWorker 消费 outbox、把已发布视频投进粉丝收件箱(或大V 缓存)。
+// FanoutWorker 是 feed 的后台 worker:消费 outbox、把已发布视频投进粉丝收件箱(或大V 缓存),
+// 并顺带消费读侧入队的过期缓存清理任务。
+//
+// 两件事合在一个循环里,是因为它们动的是同一族 key(feed:inbox:* / feed:bigv:*):
+// 写入侧的修剪就在 inboxPushScript 里,读取侧的过期清理由 FeedService 入队(见
+// enqueueStaleTrims)、这里消费。为后者单独养一个协程不值当。
 type FanoutWorker struct {
 	repo      FanoutRepository
 	feeds     FeedRepository
 	followers FollowerLister
 	bigvs     BigVChecker
 	rdb       *redis.Client
+	// cleanups 读侧过期清理任务的持久化队列。nil 表示不消费清理任务
+	// (测试里常见),投递本身不受影响。
+	cleanups CleanupTaskRepository
 }
 
 // NewFanoutWorker 构造 worker。
@@ -307,11 +315,15 @@ type FanoutWorker struct {
 // feeds(FeedRepository)单独注入而不并进 FanoutRepository:补拉要的是「查某作者最近视频」,
 // 这是 feed 的读契约、不是 outbox 的职责。从构造器注入,接线点明确,也免得 worker
 // 反向依赖别的仓储。
-func NewFanoutWorker(repo FanoutRepository, feeds FeedRepository, followers FollowerLister, bigvs BigVChecker, rdb *redis.Client) *FanoutWorker {
-	return &FanoutWorker{repo: repo, feeds: feeds, followers: followers, bigvs: bigvs, rdb: rdb}
+//
+// cleanups 是读侧清理任务的持久化队列(实现见 CleanupTaskRepository)。若为 nil 则不消费
+// 清理任务,投递本身不受影响 —— 但**生产接线必须传**(见 main.go),否则读侧入队的
+// 过期 key 永远没人在清,任务表只会一直堆积。
+func NewFanoutWorker(repo FanoutRepository, feeds FeedRepository, followers FollowerLister, bigvs BigVChecker, rdb *redis.Client, cleanups CleanupTaskRepository) *FanoutWorker {
+	return &FanoutWorker{repo: repo, feeds: feeds, followers: followers, bigvs: bigvs, rdb: rdb, cleanups: cleanups}
 }
 
-// Run 持续消费 outbox,直到 ctx 取消。
+// Run 持续消费 outbox 并顺带清理读侧过期缓存,直到 ctx 取消。
 func (w *FanoutWorker) Run(ctx context.Context) {
 	// 兜住整轮消费循环的 panic。deliverSafely 只管单条任务(DeliverOne),
 	// 而循环体自身(ClaimPending / MarkDone / MarkFailed)没有保护 —— 这层一旦 panic,
@@ -340,6 +352,12 @@ func (w *FanoutWorker) Run(ctx context.Context) {
 			return
 		default:
 		}
+
+		// 顺带把读侧攒下的过期清理做掉。放在一轮的最前面(领任务之前),理由:
+		//   - 它是「领一批就走」的,不阻塞:表空就立刻返回,投递不会被它拖住;
+		//   - 每一轮都做,所以即使一直有投递任务在跑,清理也不会被饿死;
+		//   - 空闲时每 fanoutIdleDelay 就轮到一次,清理延迟保持在毫秒级。
+		w.runCleanupSafely(ctx)
 
 		tasks, err := w.repo.ClaimPending(ctx, fanoutBatchSize)
 		if err != nil {
@@ -386,6 +404,25 @@ func (w *FanoutWorker) deliverSafely(ctx context.Context, t *FanoutTask) (err er
 		}
 	}()
 	return w.DeliverOne(ctx, t)
+}
+
+// runCleanupSafely 在 recover 保护下跑一轮读侧清理。
+//
+// 为什么它要单独兜一层:清理是**纯优化**,投递是**正确性** —— 新视频必须进到粉丝
+// 收件箱。两者共用一个循环之后,清理里任何一个意外 panic 都会顺到 Run 那层的 recover、
+// 让整个消费循环退出:等于一个清理的 bug 把投递停掉。这层把它按「本轮没清成」处理,
+// 循环下一轮照常跑 —— 任务行在领取时已被删除,所以这一批不重试,由下一次读重新入队
+// (见迁移 013)。
+func (w *FanoutWorker) runCleanupSafely(ctx context.Context) {
+	if w.cleanups == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "读侧过期清理 panic,按本轮未清理处理(不影响投递)", "panic", r)
+		}
+	}()
+	w.runCleanupBatch(ctx)
 }
 
 // sleepOrDone 睡 d 或 ctx 取消,返回 false 表示该退出。

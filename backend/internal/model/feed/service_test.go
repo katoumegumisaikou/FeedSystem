@@ -3,6 +3,7 @@ package feed
 import (
 	"context"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +19,17 @@ import (
 //
 // handler_test 里那个 latestFeedRepo 把这几个参数全忽略了,所以只能验「返回了什么」,
 // 验不了分页 —— hasMore 和复合游标都必须让仓储真的按参数筛选/截断才测得出来
+//
+// 它同时兼任 CleanupTaskRepository 的内存替身:两者出现在同一批测试里,合起来能少传一个
+// 参数。清理那部分语义(key 幂等、领取即删除)在 cleanup_test.go 里单独测。
 type pagedFeedRepo struct {
 	videos []*video.Video
+
+	// cleanupMu 保护下面两个字段(worker 的消费循环会并发调用)
+	cleanupMu    sync.Mutex
+	cleanupRows  []CleanupTask
+	cleanupSeq   int64
+	cleanupError error // 非 nil 时 EnqueueCleanup 返回它,用来验「入队失败不影响返回」
 }
 
 func (r *pagedFeedRepo) ListLatestVideos(_ context.Context, before time.Time, beforeID int64, limit int) ([]*video.Video, error) {
@@ -92,7 +102,8 @@ func newLatestService(t *testing.T, videos []*video.Video) *FeedService {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewFeedService(&pagedFeedRepo{videos: videos}, rdb, nil, nil, nil)
+	repo := &pagedFeedRepo{videos: videos}
+	return NewFeedService(repo, rdb, nil, nil, nil, repo)
 }
 
 func publishedAt(id int64, at time.Time) *video.Video {

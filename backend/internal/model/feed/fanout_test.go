@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -243,13 +244,16 @@ func (r *signalingRepo) MarkFailed(ctx context.Context, taskID int64, errMsg str
 
 // ---------- 辅助 ----------
 
-// newFanoutWorker 起一个带 miniredis 的 worker
+// newFanoutWorker 起一个带 miniredis 的 worker。
+//
+// cleanup 传 nil:这些测试关心的是投递,不需要驱动读侧清理。要测「循环顺带清理」
+// 的测试自己造 FeedService 传进去(见 TestRun_顺带清理过期缓存)。
 func newFanoutWorker(t *testing.T, feeds FeedRepository, followers FollowerLister, bigvs BigVChecker) (*FanoutWorker, *miniredis.Miniredis, *redis.Client) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
-	return NewFanoutWorker(newFakeFanoutRepo(), feeds, followers, bigvs, rdb), mr, rdb
+	return NewFanoutWorker(newFakeFanoutRepo(), feeds, followers, bigvs, rdb, nil), mr, rdb
 }
 
 // zsetEntries 取一个 ZSET 的全部 (member, score)
@@ -338,7 +342,7 @@ func TestDeliverOne_rdb为nil返回错误(t *testing.T) {
 	ctx := context.Background()
 	task := &FanoutTask{ID: 1, VideoID: 100, AuthorID: 7, PublishedAt: time.Now()}
 
-	w := NewFanoutWorker(newFakeFanoutRepo(), nil, constantFollowers(11), fakeBigV{}, nil)
+	w := NewFanoutWorker(newFakeFanoutRepo(), nil, constantFollowers(11), fakeBigV{}, nil, nil)
 
 	err := w.DeliverOne(ctx, task)
 	require.Error(t, err, "缺 Redis 必须报错,不能静默成功")
@@ -513,7 +517,7 @@ func TestReplayBigVCache_按缓存score入队重放任务(t *testing.T) {
 
 	repo := newFakeFanoutRepo()
 	// 重放不查库、不翻粉丝、不判大V,feeds/followers/bigvs 传空即可
-	w := NewFanoutWorker(repo, nil, nil, fakeBigV{}, rdb)
+	w := NewFanoutWorker(repo, nil, nil, fakeBigV{}, rdb, nil)
 
 	require.NoError(t, w.ReplayBigVCache(ctx, author))
 
@@ -541,7 +545,7 @@ func TestReplayBigVCache_空缓存不报错(t *testing.T) {
 	t.Cleanup(func() { _ = rdb.Close() })
 
 	repo := newFakeFanoutRepo()
-	w := NewFanoutWorker(repo, nil, nil, fakeBigV{}, rdb)
+	w := NewFanoutWorker(repo, nil, nil, fakeBigV{}, rdb, nil)
 
 	require.NoError(t, w.ReplayBigVCache(ctx, 7))
 	assert.Empty(t, repo.tasks, "空缓存不该产生任何任务")
@@ -549,7 +553,7 @@ func TestReplayBigVCache_空缓存不报错(t *testing.T) {
 
 // TestReplayBigVCache_rdb为nil返回错误 没有 Redis 拿不到缓存,必须报错而非假装成功。
 func TestReplayBigVCache_rdb为nil返回错误(t *testing.T) {
-	w := NewFanoutWorker(newFakeFanoutRepo(), nil, nil, fakeBigV{}, nil)
+	w := NewFanoutWorker(newFakeFanoutRepo(), nil, nil, fakeBigV{}, nil, nil)
 	require.Error(t, w.ReplayBigVCache(context.Background(), 7))
 }
 
@@ -570,7 +574,7 @@ func TestReplayBigVCache_重放任务走普通推送路径(t *testing.T) {
 
 	repo := newFakeFanoutRepo()
 	// 此刻作者已被判为非大V —— 与降级后的现实一致
-	w := NewFanoutWorker(repo, nil, constantFollowers(11, 12), fakeBigV{big: map[int64]bool{author: false}}, rdb)
+	w := NewFanoutWorker(repo, nil, constantFollowers(11, 12), fakeBigV{big: map[int64]bool{author: false}}, rdb, nil)
 
 	require.NoError(t, w.ReplayBigVCache(ctx, author))
 	require.Len(t, repo.tasks, 1)
@@ -817,7 +821,7 @@ func TestRun_单任务panic不拖垮worker(t *testing.T) {
 		failed: make(chan int64, 1),
 	}
 	// 粉丝查询故意 panic,模拟投递路径里的意外崩溃
-	w := NewFanoutWorker(repo, nil, panicFollowers{}, fakeBigV{big: map[int64]bool{7: false}}, rdb)
+	w := NewFanoutWorker(repo, nil, panicFollowers{}, fakeBigV{big: map[int64]bool{7: false}}, rdb, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -846,10 +850,163 @@ func TestRun_循环panic不拖垮进程(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = rdb.Close() })
 
-	w := NewFanoutWorker(panicClaimRepo{newFakeFanoutRepo()}, nil, nil, nil, rdb)
+	w := NewFanoutWorker(panicClaimRepo{newFakeFanoutRepo()}, nil, nil, nil, rdb, nil)
 
 	require.NotPanics(t, func() { w.Run(context.Background()) },
 		"消费循环自身的 panic 必须被兜住,不能冒到 goroutine 顶端打崩进程")
+}
+
+// TestRun_顺带清理过期缓存 钉住「读侧清理由投递循环消费任务表」。
+//
+// 清理不再有自己的协程、也没有内存队列:读路径往任务表写一行,消费由这个循环顺带做。
+// 判据是「只起了 Run,表里的任务被执行掉了、过期的 key 被清掉了」——
+// 把 runCleanupSafely 从循环里摘掉、或改回让 FeedService 自己起协程消费,这条就红。
+func TestRun_顺带清理过期缓存(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	// 读侧入队的行落在任务表替身上;worker 只拿它的消费端
+	cleanups := &pagedFeedRepo{}
+	key := inboxKey(1)
+	stale := -10 * int64(24*time.Hour/time.Microsecond)
+	seedZSet(t, rdb, key, map[int64]int64{100: stale})
+	require.NoError(t, cleanups.EnqueueCleanup(ctx, []staleTrim{{key: key, window: inboxEntry}}))
+
+	w := NewFanoutWorker(newFakeFanoutRepo(), nil, nil, fakeBigV{}, rdb, cleanups)
+
+	go w.Run(ctx)
+
+	// 必须用 Eventually:后台循环的调度不可控。它空闲时睡 fanoutIdleDelay,
+	// 所以这里 3s 的上界有充分余量
+	require.Eventually(t, func() bool { return rdb.ZCard(ctx, key).Val() == 0 },
+		3*time.Second, 10*time.Millisecond,
+		"投递循环没有顺带清理:任务表里的过期 key 必须有东西在消费")
+	assert.Zero(t, cleanups.pendingCleanups(), "领走的行不该还留在表里(领取即删除)")
+}
+
+// panickingCleanupRepo 第一次 ClaimCleanups 就 panic,之后返回空,并记录调用次数。
+type panickingCleanupRepo struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *panickingCleanupRepo) EnqueueCleanup(context.Context, []staleTrim) error { return nil }
+
+func (r *panickingCleanupRepo) ClaimCleanups(context.Context, int) ([]*CleanupTask, error) {
+	r.mu.Lock()
+	r.calls++
+	first := r.calls == 1
+	r.mu.Unlock()
+	if first {
+		panic("清理任务仓储故意 panic")
+	}
+	return nil, nil
+}
+
+func (r *panickingCleanupRepo) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// TestRun_清理panic不拖垮投递 钉住清理与投递共用一个循环带来的风险。
+//
+// 清理是**纯优化**,投递是**正确性**。两者共享循环之后,没有隔离的话一个清理 panic
+// 会顺到 Run 那层的 recover、让整个消费循环退出 —— 新视频从此进不了粉丝收件箱,
+// 一个优化项的 bug 变成投递停摆。
+//
+// 判据是「第一次 panic 之后循环还走到了第二次」:若 panic 逃到 Run 那层,循环就退出了,
+// 调用次数会永远停在 1。
+func TestRun_清理panic不拖垮投递(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	cleanups := &panickingCleanupRepo{}
+	w := NewFanoutWorker(newFakeFanoutRepo(), nil, nil, fakeBigV{}, rdb, cleanups)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool { return cleanups.callCount() >= 2 },
+		3*time.Second, 10*time.Millisecond,
+		"清理 panic 之后投递循环停了:一个清理的 bug 把投递带走了")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run 没有在 ctx 取消后退出")
+	}
+}
+
+// onceCleanupRepo 第一次领取返回一条任务,之后返回空,并记录领取次数。
+type onceCleanupRepo struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *onceCleanupRepo) EnqueueCleanup(context.Context, []staleTrim) error { return nil }
+
+func (r *onceCleanupRepo) ClaimCleanups(context.Context, int) ([]*CleanupTask, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	if r.calls == 1 {
+		return []*CleanupTask{{ID: 1, CacheKey: "k", Window: time.Hour}}, nil
+	}
+	return nil, nil
+}
+
+func (r *onceCleanupRepo) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// TestRun_清理执行panic也不停循环 上一条覆盖的是「领取时」panic,这条覆盖**执行时**。
+//
+// 两者是不同的失败面:领取失败只动一次 DB,而执行失败发生在发 Redis 命令那段 ——
+// 那正是清理真正做的事,也是最可能出意外的地方。这里用 hook 让 pipeline 直接 panic,
+// 模拟它;判据同样是「第一次 panic 之后循环还走到了第二次」。
+func TestRun_清理执行panic也不停循环(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+	rdb.AddHook(panickingPipelineHook{})
+
+	cleanups := &onceCleanupRepo{}
+	w := NewFanoutWorker(newFakeFanoutRepo(), nil, nil, fakeBigV{}, rdb, cleanups)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx)
+	}()
+
+	require.Eventually(t, func() bool { return cleanups.callCount() >= 2 },
+		3*time.Second, 10*time.Millisecond,
+		"清理执行时 panic 之后投递循环停了 —— 一个优化项的 bug 把投递带走了")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run 没有在 ctx 取消后退出")
+	}
 }
 
 // ---------- 升入大V:缓存回填 ----------
@@ -971,6 +1128,6 @@ func TestPromoteBigVCache_空结果不报错(t *testing.T) {
 
 // TestPromoteBigVCache_rdb为nil返回错误 没有 Redis 无从回填,必须报错而非假装成功。
 func TestPromoteBigVCache_rdb为nil返回错误(t *testing.T) {
-	w := NewFanoutWorker(newFakeFanoutRepo(), recentVideoFeedRepo{}, nil, fakeBigV{}, nil)
+	w := NewFanoutWorker(newFakeFanoutRepo(), recentVideoFeedRepo{}, nil, fakeBigV{}, nil, nil)
 	require.Error(t, w.PromoteBigVCache(context.Background(), 7))
 }

@@ -86,7 +86,7 @@ func TestRegisterRouter_ListLatest(t *testing.T) {
 		CreatedAt: time.Now().Add(-time.Minute),
 		Status:    video.StatusPublished,
 	}}}
-	svc := NewFeedService(repo, rdb, nil, nil, nil)
+	svc := NewFeedService(repo, rdb, nil, nil, nil, nil)
 	router := gin.New()
 	v1 := router.Group("/api/v1")
 	RegisterRouter(v1, NewFeedHandler(svc), nil, rdb)

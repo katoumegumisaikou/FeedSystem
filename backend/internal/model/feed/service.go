@@ -22,6 +22,9 @@ type FeedService struct {
 	likes     LikeStatusProvider
 	followees FolloweeLister
 	bigvs     BigVChecker
+	// cleanup 读侧过期清理的入库端。请求路径只写一行任务,发 Redis 命令由
+	// FanoutWorker 的消费循环做 —— FeedService 自己不持有后台协程、不持有队列。
+	cleanup CleanupTaskRepository
 }
 
 // LikeStatusProvider 提供用户对一批视频的点赞状态。
@@ -41,8 +44,13 @@ type BigVChecker interface {
 	Contains(ctx context.Context, authorIDs []int64) (map[int64]bool, error)
 }
 
-func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProvider, followees FolloweeLister, bigvs BigVChecker) *FeedService {
-	return &FeedService{repo: repo, rdb: rdb, likes: likes, followees: followees, bigvs: bigvs}
+// NewFeedService 构造 feed 服务。
+//
+// cleanup 是读侧清理任务的入库端(见 CleanupTaskRepository)。传 nil 则不再产生清理
+// 任务,读路径其余行为不受影响 —— 但**生产接线必须传**(见 main.go),否则过期成员
+// 没人清理,读路径会一直白白取回来再在内存里丢掉。
+func NewFeedService(repo FeedRepository, rdb *redis.Client, likes LikeStatusProvider, followees FolloweeLister, bigvs BigVChecker, cleanup CleanupTaskRepository) *FeedService {
+	return &FeedService{repo: repo, rdb: rdb, likes: likes, followees: followees, bigvs: bigvs, cleanup: cleanup}
 }
 
 // latestVideosKey / latestVideosTTL 最新流的缓存。存的是完整卡片 JSON,以
@@ -104,6 +112,20 @@ const (
 
 	bigVEntry = 7 * 24 * time.Hour  // 大V 缓存的条目窗口
 	bigVTTL   = 30 * 24 * time.Hour // 大V 缓存 key TTL,发布时重置
+
+	// followingReadWindow 关注流读取时的展示窗口。
+	//
+	// 与上面两个写入窗口同值(都是 7 天),但语义不同:那两个是「投递/裁剪窗口」、
+	// 在**写入**时执行;这个是「展示窗口」、在**读取**时执行。**三者必须保持一致** ——
+	// 读窗口更宽会把写入侧刚裁掉的边界内容放行;更窄会把刚投进来的新内容挡掉,
+	// 用户看不到自己刚发的视频。改任何一个都要同步另外两个。
+	//
+	// 为什么读侧还要单独判一次:写入侧的裁剪是「写一次扫一次」,不是定时任务。
+	// 停止更新的作者,其收件箱/大V 缓存自最后一次写入后再没人扫过,过期条目会一直
+	// 留到 key TTL —— 而读的时候是 ZRevRange(0, -1)、不带任何 score 过滤,
+	// 于是照常返回。真库上就表现为「大V 十天前发的视频仍出现在关注流里」。
+	// 截断逻辑见 ListFollowing。
+	followingReadWindow = 7 * 24 * time.Hour
 )
 
 // followingCandidateCap 关注流单页回表查询的候选条目上限。
@@ -117,6 +139,18 @@ const (
 // 本该排在本页的条目,游标会越过它、永久漏条。只截断候选条目则安全 —— 见 ListFollowing
 // 里对游标的处理。
 const followingCandidateCap = 500
+
+// 读侧惰性清理的后台参数(见 enqueueStaleTrims / runCleanupBatch)。
+//
+// 这组参数是为了把清理**从请求延迟里拿掉**:读请求只往任务表里写一行(同一个 key 幂等),
+// 发 Redis 命令由后台消费循环批量完成。
+const (
+	// cleanupClaimBatch 消费循环一轮最多领取多少条清理任务。
+	//
+	// 一次 ZRemRangeByScore 就是一次 Redis 往返,领取一批合并之后清 N 个 key 的代价≈
+	// 清 1 个;设上限是为了不让某一轮把积压的任务独占到很晚 —— 排队靠后的 key 干等。
+	cleanupClaimBatch = 128
+)
 
 // estimateBigVMax 预分配 entries 时,最多按几个大V 的缓存估容量(见 ListFollowing)。
 // 取 8:足够覆盖多数用户,又不会让「关注 200 个大V 但缓存多为空」的请求白占约 160KB。
@@ -468,6 +502,51 @@ type followingEntry struct {
 	score   int64
 }
 
+// staleTrim 一个待清理的 ZSET:key 与它自己的存储窗口。
+type staleTrim struct {
+	key    string
+	window time.Duration
+}
+
+// isOldestStale 判断一个 ZSET 快照里是否存在超期成员。
+//
+// zs 是 ZRevRange(0, -1) 的结果,按 score **降序**,所以最后一个成员最旧。
+// 它过期就说明整个集合里有超期成员 —— 只需要知道「有没有」,不需要知道有几条,
+// 因为清理是按 score 区间整段删的。纯内存判断,不发命令。
+func isOldestStale(zs []redis.Z, window time.Duration) bool {
+	if len(zs) == 0 {
+		return false
+	}
+	return int64(zs[len(zs)-1].Score) < time.Now().Add(-window).UnixMicro()
+}
+
+// enqueueStaleTrims 把读到的过期 key 写进清理任务表。
+//
+// 为什么不就在请求里删:一条 ZRemRangeByScore 就是一次 Redis 往返,而它会被算进
+// **每个**读请求的延迟。大V 缓存是全局共用的,一个热门大V 同时被成百上千个粉丝读到,
+// 同一个 key 就被重复删成百上千次 —— 每次都摊在一个真实用户的响应时间上,而删第二
+// 次起全是白做功。这里只写一行任务(同一 key 幂等),发命令挪给 FanoutWorker 的
+// 消费循环(见 cleanup.go 的 runCleanupBatch),顺带换来三件事:同一个 key 只清一次、
+// 多个 key 合并成一次往返、请求延迟里不再含清理。
+//
+// 为什么不是进程内的 channel(曾经这么写过):行内队列在进程重启时全部丢失,有容量
+// 上限、满了只能静默丢弃,而丢弃与丢失都没有任何痕迹 —— 而「某个 key 会一直留着过期
+// 成员」正是这个功能要解决的问题。入库之后每次读都会重新确认,丢一条也能自愈。
+// 幂等由 UNIQUE(cache_key) 保证,不需要额外维护一个「已入队」的内存集合 ——
+// 那种集合本身也是重启就丢、多实例下还各自为政。
+//
+// 写库失败**不**影响本次返回:清理是优化,正确性由读侧的展示窗口过滤独立保证
+// (见 ListFollowing 里的 cutoff 截断)。这里只记日志。
+func (s *FeedService) enqueueStaleTrims(ctx context.Context, trims []staleTrim) {
+	if len(trims) == 0 || s.cleanup == nil {
+		return
+	}
+	if err := s.cleanup.EnqueueCleanup(ctx, trims); err != nil {
+		slog.ErrorContext(ctx, "入队关注流缓存清理任务失败(不影响本次返回)",
+			"keys", len(trims), "err", err)
+	}
+}
+
 // ListFollowing 关注流:合并「收件箱(推模式)」与「大V 缓存(拉模式)」两个来源。
 func (s *FeedService) ListFollowing(ctx context.Context, req ListFollowingReq, userID int64) (*ListFollowingResp, error) {
 	if userID <= 0 {
@@ -500,11 +579,19 @@ func (s *FeedService) ListFollowing(ctx context.Context, req ListFollowingReq, u
 	}
 	cursorAt := cursorAtTime.UnixMicro()
 
+	// 读侧惰性清理的收集容器:读取过程中只记下「哪个 key 里有超期成员」,
+	// 读完后统一入队一次(判定与执行的完整理由见 cleanup.go 的 trimStaleKeys)
+	var stale []staleTrim
+
 	// 收件箱:推模式写入,成员是 video_id 字符串,score 是发布时刻(微秒)
-	inbox, err := s.rdb.ZRevRangeWithScores(ctx, inboxKey(userID), 0, -1).Result()
+	ik := inboxKey(userID)
+	inbox, err := s.rdb.ZRevRangeWithScores(ctx, ik, 0, -1).Result()
 	if err != nil {
 		slog.ErrorContext(ctx, "读取关注流收件箱失败", "user_id", userID, "err", err)
 		return nil, errs.ErrInternal
+	}
+	if isOldestStale(inbox, inboxEntry) {
+		stale = append(stale, staleTrim{key: ik, window: inboxEntry})
 	}
 
 	followees, err := s.followees.ListFolloweeIDs(ctx, userID)
@@ -558,8 +645,14 @@ func (s *FeedService) ListFollowing(ctx context.Context, req ListFollowingReq, u
 			slog.ErrorContext(ctx, "读取大V 缓存失败", "user_id", userID, "err", err)
 			return nil, errs.ErrInternal
 		}
-		for _, cmd := range cmds {
-			for _, z := range cmd.Val() {
+		for i, cmd := range cmds {
+			zs := cmd.Val()
+			// 大V 缓存的存储窗口是 bigVEntry(与收件箱的 inboxEntry 是同一个值,
+			// 但语义独立 —— 两者的上限/TTL 在 fanout.go 里就是分开传的)
+			if isOldestStale(zs, bigVEntry) {
+				stale = append(stale, staleTrim{key: bigVKey(bigVIDs[i]), window: bigVEntry})
+			}
+			for _, z := range zs {
 				if e, ok := parseFollowingEntry(z); ok {
 					entries = append(entries, e)
 				}
@@ -598,6 +691,34 @@ func (s *FeedService) ListFollowing(ctx context.Context, req ListFollowingReq, u
 			deduped = append(deduped, e)
 		}
 		entries = deduped
+	}
+
+	// 时间窗口:超过 followingReadWindow 的条目一律不返回。
+	//
+	// 为什么读侧必须自己判一次 —— 写入侧的 7 天裁剪(见 inboxPushScript 的
+	// ZREMRANGEBYSCORE)是「写一次扫一次」:每投递一条视频,顺手把该 key 里过期的
+	// 清掉。所以只要还有新视频进来,缓存里就不会积压过期条目。**但停止更新的作者
+	// 是个例外** —— 最后一个投递完成后,再没有任何事件去扫它,缓存里的条目
+	// 就一直躺着(直到 key TTL 到期),而读路径是 ZRevRange(0, -1)、不带 score
+	// 过滤,于是那些过期条目照常出现在关注流里。收件箱与大V 缓存都是同一套脚本、
+	// 同一个毛病,所以这一刀对**合并后的序列**做,一次覆盖两个来源。
+	//
+	// 实现只需截断,不必逐条判断:entries 已按 score 降序排好,而「过期」的判据是
+	// score < now-window,所以过期条目必然构成一个**后缀**。sort.Search 二分找到
+	// 第一个过期位置(该谓词在降序序列上单调),其后全部丢弃。O(log n)。
+	//
+	// 排在游标过滤之前,有两个理由:
+	//   1. 少扫一遍 —— 过期条目本来也会被游标滤掉(它们比游标更旧),但没必要让
+	//      游标那层去遍历它们;
+	//   2. 让下面的 hasMore 判对 —— 被时间窗口砍掉的部分**不算还有下一页**,
+	//      因为更旧的条目同样过期。若放在游标过滤之后,本页会因「后面还有过期条目」
+	//      而给出一个指向早已过期位置的游标,客户端白翻一页空页。
+	if len(entries) > 0 {
+		cutoff := time.Now().Add(-followingReadWindow).UnixMicro()
+		expiredAt := sort.Search(len(entries), func(i int) bool {
+			return entries[i].score < cutoff
+		})
+		entries = entries[:expiredAt]
 	}
 
 	if hasCursor {
@@ -702,6 +823,11 @@ func (s *FeedService) ListFollowing(ctx context.Context, req ListFollowingReq, u
 	if err := s.rdb.Expire(ctx, inboxKey(userID), inboxTTL).Err(); err != nil {
 		slog.WarnContext(ctx, "刷新收件箱 TTL 失败", "user_id", userID, "err", err)
 	}
+
+	// 读侧惰性清理放在最后,且只**入库**:它不影响本次返回的内容(内容已按展示窗口
+	// 过滤好了),发 Redis 命令的耗时不该算进这个请求的延迟(见 enqueueStaleTrims)。
+	// 也因此写库失败、甚至 worker 没在跑,响应都照常返回。
+	s.enqueueStaleTrims(ctx, stale)
 
 	return &resp, nil
 }
