@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { App, Form, Input, Button, Divider } from 'antd';
 import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
-import { login } from '../../api/auth';
+import { login, getMyProfile } from '../../api/auth';
 import type { LoginReq } from '../../types/auth';
 
 // 登录成功后后端通过 SetTokenCookies 写入 access_token / refresh_token
@@ -16,10 +16,12 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(values);
+      const me = await getMyProfile(); 
       message.success('登录成功');
-      router('/'); // 首页暂未实现,先跳根路径
+      router(`/users/${me.id}`); // 跳到当前登录用户自己的主页
     } catch {
       // 拦截器已弹错
+      message.error('登录失败')
     } finally {
       setLoading(false);
     }
@@ -64,8 +66,7 @@ export default function LoginPage() {
 
       <Divider style={{ margin: '12px 0' }} />
 
-      <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-        <Link to="/login/sms">短信验证码登录</Link>
+      <div style={{ textAlign: 'center' }}>
         <Link to="/forgot-password">忘记密码</Link>
       </div>
 
