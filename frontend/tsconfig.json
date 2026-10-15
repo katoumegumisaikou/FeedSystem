@@ -13,6 +13,9 @@
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
+    // vitest 开了 globals,这里补上全局 describe/it/expect 的类型,
+    // 否则 tsc --noEmit 会在测试文件里报 "Cannot find name 'describe'"
+    "types": ["vitest/globals"],
     "allowSyntheticDefaultImports": true,
     "forceConsistentCasingInFileNames": true
   },
