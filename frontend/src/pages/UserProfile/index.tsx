@@ -31,24 +31,39 @@ export default function UserProfilePage() {
 
   // ③ useEffect:组件渲染后要做的「副作用」(发请求就是典型)。
   //    依赖数组 [userId] 表示:只在 userId 变化时重跑 —— 否则每次渲染都发请求会死循环。
+  //    effect 回调不能直接写成 async(async 会返回 Promise,React 不认),所以套一个
+  //    立即执行的 async 函数: (async () => { ... })()
   useEffect(() => {
     if (!validId) return;
-    setUserLoading(true);
-    getUserProfile(userId)
-      .then(setUser)
-      // .finally 保证出错也能关掉 loading(错误提示已由 axios 拦截器统一弹出)
-      .finally(() => setUserLoading(false));
+
+    (async () => {
+      setUserLoading(true);
+      try {
+        const data = await getUserProfile(userId);
+        setUser(data);
+      } catch {
+        // 错误提示已由 axios 拦截器统一弹出,这里吞掉,避免未处理的 Promise rejection
+      } finally {
+        setUserLoading(false);
+      }
+    })();
   }, [userId, validId]);
 
   useEffect(() => {
     if (!validId) return;
-    setVideosLoading(true);
-    listUserVideos(userId)
-      .then((resp) => {
+
+    (async () => {
+      setVideosLoading(true);
+      try {
+        const resp = await listUserVideos(userId);
         setVideos(resp.items);
         setNextCursor(resp.next_cursor);
-      })
-      .finally(() => setVideosLoading(false));
+      } catch {
+        // 同上,拦截器已弹错
+      } finally {
+        setVideosLoading(false);
+      }
+    })();
   }, [userId, validId]);
 
   // ④ 「加载更多」:拿上一页的游标接着拉,结果**追加**到列表尾部(不是替换)。
@@ -60,6 +75,8 @@ export default function UserProfilePage() {
       const resp = await listUserVideos(userId, nextCursor);
       setVideos((prev) => [...prev, ...resp.items]);
       setNextCursor(resp.next_cursor);
+    } catch {
+      // 错误提示已由 axios 拦截器弹出,这里吞掉
     } finally {
       setVideosLoading(false);
     }
@@ -79,6 +96,21 @@ export default function UserProfilePage() {
   if (!user) {
     return <Empty description="用户不存在" style={{ padding: 48 }} />;
   }
+
+  // 作品列表:没有作品且不在加载 → 空态;否则铺成响应式网格。
+  // key 用视频 id(稳定),不能用数组下标 —— 否则插入/删除时 React 会错认元素
+  const videoList =
+    videos.length === 0 && !videosLoading ? (
+      <Empty description="还没有发布作品" />
+    ) : (
+      <Row gutter={[16, 16]}>
+        {videos.map((v) => (
+          <Col key={v.id} xs={24} sm={12} md={8}>
+            <VideoCard video={v} />
+          </Col>
+        ))}
+      </Row>
+    );
 
   return (
     <div style={{ maxWidth: 960, margin: '0 auto', padding: 24 }}>
@@ -102,19 +134,7 @@ export default function UserProfilePage() {
 
       <Typography.Title level={5}>TA 的作品</Typography.Title>
 
-      {videos.length === 0 && !videosLoading ? (
-        <Empty description="还没有发布作品" />
-      ) : (
-        <Row gutter={[16, 16]}>
-          {/* 列表渲染必须给每个元素一个稳定的 key —— 这里用视频 id,
-              不能用数组下标,否则插入/删除时 React 会错认元素 */}
-          {videos.map((v) => (
-            <Col key={v.id} xs={24} sm={12} md={8}>
-              <VideoCard video={v} />
-            </Col>
-          ))}
-        </Row>
-      )}
+      {videoList}
 
       <div style={{ textAlign: 'center', marginTop: 24 }}>
         {nextCursor ? (
