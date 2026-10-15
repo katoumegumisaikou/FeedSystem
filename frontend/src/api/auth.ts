@@ -6,7 +6,6 @@ import type {
   RegisterReq,
   SendSmsCodeReq,
   SendSmsCodeResp,
-  SmsLoginReq,
   UserResp,
 } from '../types/auth';
 
@@ -19,11 +18,6 @@ export function register(req: RegisterReq): Promise<LoginSuccessResp> {
 }
 
 export function login(req: LoginReq): Promise<LoginSuccessResp> {
-  return request<LoginSuccessResp>({ url: '/auth/login', method: 'post', data: req });
-}
-
-// 复用 /auth/login 接口,由后端 service 层按 sms_code 分支处理
-export function smsLogin(req: SmsLoginReq): Promise<LoginSuccessResp> {
   return request<LoginSuccessResp>({ url: '/auth/login', method: 'post', data: req });
 }
 

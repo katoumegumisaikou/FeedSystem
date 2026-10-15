@@ -19,11 +19,6 @@ export interface LoginReq {
   password: string;
 }
 
-export interface SmsLoginReq {
-  phone: string;
-  sms_code: string;
-}
-
 export interface ChangePasswordReq {
   phone: string;
   sms_code: string;
