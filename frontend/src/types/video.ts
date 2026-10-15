@@ -46,3 +46,11 @@ export interface ListUserVideosResp {
   items: VideoResp[];
   next_cursor?: UserVideoCursor;
 }
+
+// 点赞 / 取消点赞的结果,对应后端 LikeResp。
+// 两个字段都回:前端乐观更新后要用服务端真值纠正 —— 只回 bool 的话,
+// 并发点赞导致的计数变化就反映不出来
+export interface LikeResp {
+  is_like: boolean;
+  likes_count: number;
+}

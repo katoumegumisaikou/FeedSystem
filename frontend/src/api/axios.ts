@@ -10,6 +10,10 @@ export function setGlobalMessage(instance: MessageInstance) {
   globalMessage = instance;
 }
 
+// 在 axios 配置上扩展一个 silent 开关:带它的请求失败时,拦截器不弹错误提示。
+// 用于"后台探测"类请求(比如判断有没有登录)—— 未登录时 401 不该打扰用户
+export type RequestConfig = AxiosRequestConfig & { silent?: boolean };
+
 // baseURL 用相对路径,开发环境由 vite.config.ts 代理到后端;
 // withCredentials 让后端 SetTokenCookies 的 cookie 跨端口生效。
 const http = axios.create({
@@ -22,19 +26,21 @@ const http = axios.create({
 http.interceptors.response.use(
   (resp: AxiosResponse<ApiResp>) => {
     const body = resp.data;
+    const silent = (resp.config as RequestConfig).silent;
     if (body && typeof body === 'object' && 'code' in body) {
       if (body.code === 0) {
         return body.data as unknown as AxiosResponse;
       }
-      globalMessage?.error(body.msg || '请求失败');
+      if (!silent) globalMessage?.error(body.msg || '请求失败');
       return Promise.reject(new Error(body.msg || `code=${body.code}`));
     }
     // 兼容没有 code 的响应
     return resp;
   },
   (err: AxiosError<ApiResp>) => {
+    const silent = (err.config as RequestConfig | undefined)?.silent;
     const msg = err.response?.data?.msg || err.message || '网络错误';
-    globalMessage?.error(msg);
+    if (!silent) globalMessage?.error(msg);
     return Promise.reject(err);
   },
 );
@@ -42,7 +48,7 @@ http.interceptors.response.use(
 // 返回业务数据 T。axios 拦截器的类型签名要求"进什么类型出什么类型",但这里已把
 // {code, msg, data} 解包成 data,与 AxiosResponse 不符;把 as 强转收拢在此函数,
 // 调用方(api/*.ts)才能拿到诚实的 T,避免"类型是 AxiosResponse、运行时是业务数据"的错位扩散。
-export function request<T>(config: AxiosRequestConfig): Promise<T> {
+export function request<T>(config: RequestConfig): Promise<T> {
   return http.request(config) as unknown as Promise<T>;
 }
 

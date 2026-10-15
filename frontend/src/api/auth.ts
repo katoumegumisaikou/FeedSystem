@@ -26,9 +26,9 @@ export function logout(): Promise<{ logged_out: boolean }> {
   return request<{ logged_out: boolean }>({ url: '/auth/logout', method: 'post' });
 }
 
-// 需登录
-export function getMyProfile(): Promise<UserResp> {
-  return request<UserResp>({ url: '/users/me', method: 'get' });
+// 需登录。silent=true 时失败不弹提示 —— 用于后台探测登录态(未登录 401 不该打扰用户)
+export function getMyProfile(opts?: { silent?: boolean }): Promise<UserResp> {
+  return request<UserResp>({ url: '/users/me', method: 'get', silent: opts?.silent });
 }
 
 // dev 模式下返回的 data.sms_code 有值,方便调试

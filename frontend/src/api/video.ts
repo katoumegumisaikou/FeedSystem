@@ -1,5 +1,5 @@
 import { request } from './axios';
-import type { ListUserVideosResp, UserVideoCursor } from '../types/video';
+import type { LikeResp, ListUserVideosResp, UserVideoCursor } from '../types/video';
 
 // 某人的视频列表,路径对齐 backend/internal/model/video/router.go 的 GET /users/:id/videos。
 //
@@ -25,4 +25,15 @@ export function listUserVideos(
       cursor_video_id: cursor?.video_id,
     },
   });
+}
+
+// 点赞 / 取消点赞,路径对齐 backend/internal/model/video/router.go 的
+// POST /videos/:id/like 与 DELETE /videos/:id/like(需登录)。
+// 后端返回操作后的真值(is_like + likes_count),前端用它纠正本地状态。
+export function likeVideo(id: number): Promise<LikeResp> {
+  return request<LikeResp>({ url: `/videos/${id}/like`, method: 'post' });
+}
+
+export function unlikeVideo(id: number): Promise<LikeResp> {
+  return request<LikeResp>({ url: `/videos/${id}/like`, method: 'delete' });
 }
