@@ -17,7 +17,14 @@ npm run typecheck
 
 # 4. 生产构建
 npm run build
+
+# 5. 跑测试(vitest + React Testing Library)
+npm test
 ```
+
+> **Node 版本:** 本工程要求 Node 20+(`package.json` 的 `engines.node: ">=20"`)。
+> 测试基建的所有 devDependencies 均已固定在 Node 20 可用的大版本上
+> (`jsdom@^26`、`@testing-library/jest-dom@^6`),不要在 Node 20 上升级它们的主版本。
 
 ## 环境变量
 
