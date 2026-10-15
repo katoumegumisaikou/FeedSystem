@@ -60,12 +60,27 @@ func (s *AccountService) loginLockCheck(ctx context.Context, phone string) (time
 	if s.rdb == nil {
 		return 0, nil
 	}
-	ttl, err := s.rdb.TTL(ctx, s.loginLockFlagKey(phone)).Result()
+	key := s.loginLockFlagKey(phone)
+
+	// 先用 EXISTS 判存在,再读 TTL。不能只按 TTL 的正负判断:
+	// key 不存在时 TTL 返回 -2,存在却没设过期时返回 -1 —— 两者都是负数,语义却相反。
+	// 只写 `ttl < 0 → 未锁定` 会把「存在但无 TTL」的标记当成「不存在」放过(fail-open)
+	exists, err := s.rdb.Exists(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+	if exists == 0 {
+		return 0, nil // 标记不存在 → 未锁定
+	}
+
+	ttl, err := s.rdb.TTL(ctx, key).Result()
 	if err != nil {
 		return 0, err
 	}
 	if ttl < 0 {
-		return 0, nil
+		// 标记存在却没有 TTL:锁定标记一律带 TTL,这是异常数据。
+		// 按「已锁定」兜底(封顶 MaxTTL),不能 fail-open 放行
+		return loginLockMaxTTL, nil
 	}
 	return ttl, nil
 }
@@ -299,15 +314,43 @@ func (s *AccountService) UpdateProfile(ctx context.Context, userID int64, req Up
 	return toUserResp(user), nil
 }
 
-// SendSmsCode 生成 6 位验证码存 Redis(5 分钟);dev 模式返回明文,生产返回空串
+const (
+	smsCodeTTL      = 5 * time.Minute  // 验证码有效期:用户从收到到输入的窗口
+	smsCodeCooldown = 60 * time.Second // 同号重发冷却:防刷 / 防短信轰炸
+)
+
+// SendSmsCode 生成 6 位验证码存 Redis(smsCodeTTL);同一手机号在 smsCodeCooldown 内只能发一次。
+// dev 模式返回明文,生产返回空串。
 func (s *AccountService) SendSmsCode(ctx context.Context, req SendSmsCodeReq) (string, error) {
 	if s.rdb == nil {
 		return "", errs.ErrInternal.WithMsg("短信服务未启用")
 	}
+
+	// 冷却用 SET NX EX 抢占:一条命令原子完成,且不必去解读 TTL 的 -1/-2 语义
+	cdKey := smsCooldownKey(req.Phone)
+	ok, err := s.rdb.SetNX(ctx, cdKey, 1, smsCodeCooldown).Result()
+	if err != nil {
+		return "", errs.ErrInternal.WithMsg("短信服务异常")
+	}
+	if !ok {
+		// 冷却已被占 → 读出剩余秒数告诉用户;竞态下 TTL 可能为负(刚好过期),兜底给通用提示
+		ttl, err := s.rdb.TTL(ctx, cdKey).Result()
+		if err != nil {
+			return "", errs.ErrInternal.WithMsg("短信服务异常")
+		}
+		if secs := int(ttl.Seconds()); secs > 0 {
+			return "", errs.ErrTooFrequent.WithMsg(fmt.Sprintf("请 %d 秒后再试", secs))
+		}
+		return "", errs.ErrTooFrequent.WithMsg("请稍后再试")
+	}
+
 	code := fmt.Sprintf("%06d", rand.Intn(1000000))
-	if err := s.rdb.Set(ctx, smsCodeKey(req.Phone), code, 5*time.Minute).Err(); err != nil {
+	if err := s.rdb.Set(ctx, smsCodeKey(req.Phone), code, smsCodeTTL).Err(); err != nil {
+		// 写码失败就别占着冷却,否则用户白等一轮
+		s.rdb.Del(ctx, cdKey)
 		return "", errs.ErrInternal.WithMsg("验证码存储失败")
 	}
+
 	fmt.Printf("[SMS-DEV] phone=%s code=%s\n", req.Phone, code)
 	if s.devMode {
 		return code, nil
@@ -318,6 +361,12 @@ func (s *AccountService) SendSmsCode(ctx context.Context, req SendSmsCodeReq) (s
 // 验证码的 Redis key;写入与校验必须共用,拼错会导致校验恒失败
 func smsCodeKey(phone string) string {
 	return "feed:sms:" + phone
+}
+
+// 重发冷却的 key,与验证码 key 分开:两者 TTL 语义不同(有效期 vs 冷却),
+// 共用一个 key 必然让其中一个错 —— 要么码活得太短,要么冷却变成 5 分钟
+func smsCooldownKey(phone string) string {
+	return "feed:sms:cooldown:" + phone
 }
 
 // 验证码失败的统一文案

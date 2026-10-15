@@ -599,6 +599,18 @@ func TestSendSmsCode(t *testing.T) {
 		_, err := svc.SendSmsCode(context.Background(), SendSmsCodeReq{Phone: testPhone})
 		assertCode(t, err, errs.ErrInternal)
 	})
+
+	t.Run("同号在冷却期内重发被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		ctx := context.Background()
+
+		_, err := svc.SendSmsCode(ctx, SendSmsCodeReq{Phone: testPhone})
+		require.NoError(t, err)
+
+		// 60 秒冷却未过,第二次必须被拒(否则前端倒计时就是纸糊的)
+		_, err = svc.SendSmsCode(ctx, SendSmsCodeReq{Phone: testPhone})
+		assertCode(t, err, errs.ErrTooFrequent)
+	})
 }
 
 func TestChangePassword(t *testing.T) {
