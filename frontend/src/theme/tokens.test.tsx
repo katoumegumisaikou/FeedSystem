@@ -19,6 +19,16 @@ describe('深色设计 token', () => {
     expect(darkTokens.token?.colorTextTertiary).toBe('#71717a');
   });
 
+  // 这几项若不显式给,会被「浅色算法 + 深色种子」推成坏值(实测):
+  // 描边/分隔线推成纯黑 → 看不见;布局底推成 #020204 → 比沉浸底还黑;
+  // 气泡底推成近白 → 与它的白字撞成白字白底。所以每一项都得钉住。
+  it('推导会出坏值的几项也显式钉住(描边/分隔线/布局底/气泡底)', () => {
+    expect(darkTokens.token?.colorBorderSecondary).toBe('#2c2c36');
+    expect(darkTokens.token?.colorSplit).toBe('rgba(245,245,247,0.10)');
+    expect(darkTokens.token?.colorBgLayout).toBe('#0b0b0f');
+    expect(darkTokens.token?.colorBgSpotlight).toBe('#2c2c36');
+  });
+
   it('圆角取 spec 的 8 / 12', () => {
     expect(darkTokens.token?.borderRadius).toBe(8);
     expect(darkTokens.token?.borderRadiusLG).toBe(12);

@@ -7,12 +7,20 @@ import type { ThemeConfig } from 'antd';
 // 在自己的子树里嵌套 <ConfigProvider theme={darkTokens}>。嵌套只覆盖这里显式写出的 token,
 // 父层那些浅色页拿不到任何一项,也就不会被刷黑。
 //
-// 为什么只写 token、不挂 darkAlgorithm:算法是全局的,挂上会顺着 ConfigProvider 树影响
-// 所有后代;而且这几个色值来自设计稿,不是算法推导的结果。代价是这里没显式写的 token 仍旧
-// 按「浅色算法 + 深色种子」推:colorFill* / colorTextQuaternary 推出来还能用,描边类不行 ——
-// antd 推导描边用的是 getSolidColor(把底色**压暗**),而 #0b0b0f 已经接近纯黑,推导值全是
-// #000000(实测):所以 colorBorder 必须显式给(见下);colorBorderSecondary 同理(推导值
-// 也是纯黑),它管的是分隔线,等 Task 9 / 11 真有分隔线要画时按需补。
+// 为什么只写 token、不挂 darkAlgorithm:决定性理由是 —— **darkAlgorithm 会把 colorPrimary
+// 从 #1677ff 改成 #1668dc**(实测),那等于新造了一个强调色,违反"与浅色页共用同一品牌色"。
+// (次要理由:算法会沿 ConfigProvider 树影响所有后代,包括将来任何嵌套子树。)
+//
+// 代价是没显式写的 token 仍按「浅色算法 + 深色种子」推,而其中几项推出来是坏的(实测):
+//   - colorBorder / colorBorderSecondary 推成纯黑 #000000(antd 用 getSolidColor 把底色继续
+//     压暗,而 #0b0b0f 已近纯黑)→ 等于没有描边
+//   - colorSplit 推成 rgba(0,0,0,0.99) → 分隔线不可见(Divider 用的是 colorSplit,不是
+//     colorBorderSecondary;后者管 Card / Table / Tabs 之类的边框)
+//   - colorBgLayout 推成 #020204 → 比 spec §13 的沉浸底 #0b0b0f 还黑
+//   - colorBgSpotlight 推成 rgba(245,245,247,0.85)(近白),而气泡文字是 colorTextLightSolid
+//     (#fff)→ 白字白底,几乎不可读
+// 以上几项都已显式钉住(见下,且有断言守着)。其余推导值属 antd 常态(如 colorTextQuaternary
+// ≈2.34:1 是"禁用态"的常见强度),可用,但不能拿来承载正文或占位说明。
 
 /** 间距刻度:4 / 8 / 12 / 16 / 24 / 36(spec §13)。antd 没有 spacing token,只能自己给。 */
 export const spacing = {
@@ -37,8 +45,15 @@ export const darkTokens: ThemeConfig = {
     colorBgContainer: '#16161c',
     // 浮层(下拉、弹层、气泡)要比面板再亮一档,否则弹层与面板糊在一起分不出层级。
     colorBgElevated: '#1c1c24',
-    // 描边:必须显式给 —— 见文件头,推导值是纯黑 #000000,等于没有描边。
+    // 描边与分隔线:必须显式给 —— 见文件头,推导值是纯黑 #000000 / rgba(0,0,0,0.99),等于没有。
     colorBorder: '#2c2c36',
+    colorBorderSecondary: '#2c2c36',
+    colorSplit: 'rgba(245,245,247,0.10)',
+    // 布局底:推导值 #020204 比 spec §13 的沉浸底还黑,显式对齐。
+    colorBgLayout: '#0b0b0f',
+    // 气泡/浮窗底(Tooltip / Popover):推导值是近白 rgba(245,245,247,0.85),而它的文字色是
+    // colorTextLightSolid(#fff)→ 白字白底不可读。改成深色面,白字才成立。
+    colorBgSpotlight: '#2c2c36',
 
     // 主文字 / 次文字 —— spec §13 的值。colorTextBase 只是种子,antd 正文实际取 colorText,
     // 两个都写才不会有一处掉回浅色兜底。在 #16161c 上分别是 16.55:1 与 7.03:1,都过 AA。
