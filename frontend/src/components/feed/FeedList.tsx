@@ -153,9 +153,18 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
   //      一屏高、吸附又是对齐到顶边的,滚到底时吸附会把位置拉回最后一屏的顶边,哨兵正好卡在
   //      滚动区下沿**之外**,只有手指还在拖、位置还没被拉回的那一瞬它才真的进视口。
   //      只靠 ①,这行字可能永远不出现(单条一页时更是连 1px 都拖不动)。
+  // ① 只认"从不可见变成可见"那**一次跳变**,而且要求此刻**已经有内容**:
+  //   - 有内容:首帧 items 为空时哨兵是滚动区里唯一的孩子,浏览器那次初始 IO 回调会立刻报可见;
+  //     若此刻就把门打开,这道门等于不存在(首屏"空页 + 有游标"正是它要挡的情形)。
+  //   - 认跳变而非当前值:上面那次"可见"会一直留着,直到哨兵真的移出视口浏览器才再回调一次;
+  //     只看当前值的话,内容一到位就会被那次**陈旧的可见**打开。
+  //   内容不足一屏的情形不靠这条(哨兵始终可见、根本没有跳变),由信号 ②(贴底几何)兜住。
+  const wasSentinelInView = useRef(false);
   useEffect(() => {
-    if (sentinelInView) setReachedTail(true);
-  }, [sentinelInView]);
+    const justBecameVisible = sentinelInView && !wasSentinelInView.current;
+    wasSentinelInView.current = sentinelInView;
+    if (justBecameVisible && items.length > 0) setReachedTail(true);
+  }, [sentinelInView, items.length]);
 
   // ② 的实现:读滚动容器的三条几何值,贴到底(容差见 TAIL_SLACK_PX)就置真。
   // 挂载时先判一次 —— 内容不足一屏时(单条一页)根本没有滚动,这一刻就已经在底部;
@@ -353,6 +362,9 @@ const tailStatusStyle: CSSProperties = {
   right: 0,
   marginLeft: 'auto',
   marginRight: 'auto',
+  // width 必须是"非 auto",靠 auto 外边距居中的那条路才成立:left/right 都给了死值、width 又是 auto 时,
+  // CSS 会把这两个 auto 外边距算成 0、让盒子**填满**那一段 —— 那就不是"底部一小条",而是横贯画面的黑带。
+  width: 'fit-content',
   maxWidth: '80%',
   display: 'flex',
   alignItems: 'center',

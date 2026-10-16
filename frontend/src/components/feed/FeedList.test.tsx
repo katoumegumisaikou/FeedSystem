@@ -712,3 +712,33 @@ describe('没有 IntersectionObserver 的环境:触底加载有手动出口', ()
     expect(screen.getByText(END_TEXT)).toBeInTheDocument();
   });
 });
+
+describe('到底那行字不会被"内容到位之前的哨兵信号"提前打开', () => {
+  beforeEach(() => {
+    stubListGeometry();
+  });
+
+  afterEach(() => {
+    unstubGeometry();
+  });
+
+  it('首屏是"空页 + 有游标"时,哨兵在内容到位前发出的可见信号不算数', async () => {
+    // 首帧里 items 还是空的,而哨兵是滚动区里唯一的孩子 —— 它就在视口里。
+    // 浏览器那次初始 IO 回调(~1 帧,React 里看不见)会立刻报 isIntersecting。
+    // 若信号 ① 不判"有没有内容",这道门在首屏就被打开:等第二页也到底时,用户其实什么都没看到,
+    // 屏幕上却已经摆着"没有更多了" —— 正是这道门要挡的那种情形。
+    const load = makeLoad([
+      { items: [], nextCursor: CURSOR_B },
+      { items: [makeItem(1), makeItem(2), makeItem(3)], nextCursor: undefined },
+    ]);
+
+    renderList(load);
+    // 首屏还没有内容时,哨兵"进过视口"这一下(它同时也是"拉下一页"的信号)
+    await atTail();
+    await flush();
+
+    expect(load).toHaveBeenCalledTimes(2);
+    // 第二页有内容、游标也没了(确实到底),但用户从没滑到底过 → 先不摆这行字
+    expect(screen.queryByText(END_TEXT)).not.toBeInTheDocument();
+  });
+});
