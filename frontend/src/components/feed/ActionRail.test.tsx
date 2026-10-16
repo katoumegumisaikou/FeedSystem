@@ -20,12 +20,26 @@ vi.mock('../../api/video', () => ({
   unlikeVideo: vi.fn(),
 }));
 
+// 关注槽位里的 FollowButton 会把 useFollowees 挂起来。这里把 hook 本身换成一根探针:
+//   ① 这个文件只管 ActionRail 自己的接线(槽位里有没有按钮、递过去的 author_id 对不对),
+//      关注按钮的加载 / 已关注 / 点下去打哪个接口由 FollowButton.test.tsx 负责;
+//   ② 真的放行那份全量请求,会让"渲染完就断言"的用例收到一次异步 setState,
+//      测试输出里就会多出一堆 act 警告 —— 把 hook 钉住,输出保持干净。
+// ids 由用例自己摆(setFollowee 在生产里只从成功响应里调,这里不需要)。
+const followeesState = vi.hoisted(() => ({ ids: new Set<number>() }));
+
+vi.mock('../../hooks/useFollowees', () => ({
+  useFollowees: () => ({ ids: followeesState.ids, loading: false, refresh: () => {} }),
+  setFollowee: () => {},
+}));
+
 const likeVideoMock = vi.mocked(likeVideo);
 const unlikeVideoMock = vi.mocked(unlikeVideo);
 
 beforeEach(() => {
   likeVideoMock.mockReset();
   unlikeVideoMock.mockReset();
+  followeesState.ids = new Set();
 });
 
 // 路由探针:把当前 pathname 画在 DOM 上。
@@ -208,10 +222,25 @@ describe('ActionRail 的槽位与可读性', () => {
     ]);
   });
 
-  it('关注槽位是空的占位:关注按钮与关注接口是 Task 7 的活,这里不提前接', () => {
+  it('关注槽位里是 FollowButton,且接的是本条视频的作者(不是视频 id)', () => {
+    // 摆一个"关注了作者 7(本条视频的 author_id)"的全量列表:
+    // 按钮若被喂了 video.id(42)或别的数,这里就会显示"关注"而不是"已关注"。
+    followeesState.ids = new Set([ITEM.author_id]);
     renderRail();
 
-    expect(screen.getByTestId('action-rail-follow')).toBeEmptyDOMElement();
+    const slot = screen.getByTestId('action-rail-follow');
+    const followButton = screen.getByTestId('follow-button');
+    expect(slot).toContainElement(followButton);
+    expect(followButton).toHaveTextContent('已关注');
+  });
+
+  it('没关注这个作者时槽位显示"关注"', () => {
+    followeesState.ids = new Set([999]);
+    renderRail();
+
+    const followButton = screen.getByTestId('follow-button');
+    expect(followButton).toHaveTextContent('关注');
+    expect(followButton).not.toHaveTextContent('已关注');
   });
 
   it('计数是浮在视频上的文字:主文字色 + 与遮罩同源的文字阴影,不赌画面恰好够暗', () => {

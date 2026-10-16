@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { likeVideo, unlikeVideo } from '../../api/video';
 import { spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
+import FollowButton from './FollowButton';
 import { CommentIcon, HeartIcon, UserIcon } from './icons';
 
 // 与 VideoPanel 同一份"浮在视频上的文字色"。不新造颜色:浮层里的颜色各处自己写一遍,
@@ -41,7 +42,7 @@ export interface ActionRailProps {
   video: FeedItem;
 }
 
-// 右侧操作栏:头像 / 点赞 / 评论 / 关注槽位,自上而下。
+// 右侧操作栏:头像 / 点赞 / 评论 / 关注,自上而下。
 //
 // 它只管"这一条视频的互动入口长什么样",不管自己浮在哪里 —— 定位(右下角、浮在遮罩带上、
 // 拦住点击免得冒泡到切声音)由 VideoPanel 的右侧槽位负责,组合点在 Task 8 的 FeedList。
@@ -168,10 +169,12 @@ export default function ActionRail({ video }: ActionRailProps) {
         <span style={countTextStyle}>{video.comment_count}</span>
       </div>
 
-      {/* 4. 关注槽位:占位,空的。关注按钮连同它要调的关注接口是 Task 7 的活,
-          在这里提前拉一个进来就等于把两个任务焊死在一起(见计划 R3)。
-          空的 div 就够 —— Task 7 会直接在这儿放 <FollowButton authorId={video.author_id} />。 */}
-      <div data-testid="action-rail-follow" />
+      {/* 4. 关注 → FollowButton。它自己管"已关注没有"(那份全量关注列表缓存在 useFollowees
+          里,模块级、整屏一份),ActionRail 只把本条视频的 author_id 递进去 ——
+          右侧栏不必知道关注接口长什么样,也不必知道列表缓存在哪。 */}
+      <div data-testid="action-rail-follow">
+        <FollowButton authorId={video.author_id} />
+      </div>
     </div>
   );
 }
