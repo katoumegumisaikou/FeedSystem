@@ -42,6 +42,20 @@ export const spacing = {
  *  两处必须同源:各写一份的话,作者名要么被压在导航底下,要么空出一大块。 */
 export const SIDEBAR_WIDTH = 200;
 
+/** 「一屏」的高度:外壳(MainLayout)、流的根(FeedList)、单个视频面板(VideoPanel)同用一份。
+ *
+ *  为什么要有这个常量:这三处的高度**必须相等** —— 面板是"一屏一屏"吸附的,外壳与流的根
+ *  也各自撑满一屏;只要有一处差一条,视频就会跟外壳错开(底部露出一条底色,吸附也对不齐)。
+ *  之前这三个值分别写在三个文件里,改一处忘一处就是这种错;现在定义只有这一份。
+ *
+ *  为什么是这一对值:100vh 是"大视口高" —— 移动端浏览器带地址栏时它比真正看得见的高度大,
+ *  底部那排(作者名 / 操作栏)会被压到地址栏下面;100dvh 是动态视口高,跟着地址栏伸缩。
+ *  不支持 dvh 的老浏览器忽略 maxHeight(它只是把高度**夹住**,不是拉伸),自然退回 100vh。 */
+export const FULL_VIEWPORT_HEIGHT = {
+  height: '100vh',
+  maxHeight: '100dvh',
+} as const;
+
 export const darkTokens: ThemeConfig = {
   token: {
     // 背景(沉浸底)与表面(侧栏 / 面板)—— spec §13 的两个底色。

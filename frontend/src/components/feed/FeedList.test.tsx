@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { StrictMode, type ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
@@ -21,6 +21,10 @@ const LOADING_TEXT = '加载中…';
 const ERROR_TEXT = '加载失败,点此重试';
 const END_TEXT = '没有更多了';
 const EMPTY_TEXT = '还没有视频 · 去上传你的第一条';
+// Task 11 新增的一句:**没有 IntersectionObserver 的环境**下手动出口上的文案。
+// 它不在 spec §13 那张四态表里(那张表假设"触底"这件事一定有人触发),所以逐字抄在这里,
+// 组件那边一改,这条就该红。
+const MORE_TEXT = '加载更多';
 
 // —— 替身 1:IntersectionObserver ——
 // 与 VideoPanel.test.tsx / hooks/useInView.test.ts 同一套写法:把回调和被观察元素交到测试手上,
@@ -470,6 +474,12 @@ describe('FeedList 作为三流的组合点', () => {
 
     const scroller = screen.getByTestId('feed-list');
     expect(scroller.style.overflowY).toBe('auto');
+    // 滚动行为留在 overflowY 上(滚轮 / 触摸 / 键盘 / 吸附),但**滚动条本身**由这条类名的
+    // CSS 藏掉:classic 滚动条会在滚动区里侧吃掉约 15px,视频右缘之外于是露出一条底色,
+    // "满屏出血"只是近似。伪元素(::-webkit-scrollbar)inline 表达不了,所以规则在 feed.css 里;
+    // 这一条钉的是"钩子还在" —— 类名一掉,那份 CSS 就成了死代码。
+    // (jsdom 不跑样式表,真正的滚动条行为只能在真机上看,见 task-11 走查清单。)
+    expect(scroller).toHaveClass('feed-scroller');
     // 满屏流要的是"一定对齐",所以是 mandatory 而不是 proximity
     expect(scroller.style.scrollSnapType).toBe('y mandatory');
 
@@ -493,5 +503,212 @@ describe('FeedList 作为三流的组合点', () => {
     // 把首屏那次请求就地落地:不让它在用例结束后才 setState(那会打出 act 警告,
     // 而且警告会算到"下一个"用例头上,很难定位)。
     await flush();
+  });
+});
+
+// 状态浮层是钉在视口上的(见 FeedList 里"为什么挂在滚动容器外面"),所以它按**自己的盒子**居中;
+// 而左侧那条导航是 fixed 浮层,盖在视频上、占掉视口最左 200px。窄屏(375px)下居中就落在了导航底下 ——
+// 那行字里正好是重试按钮,只露出约 38px 可点。修法是让**浮层自己**让开,
+// 而不是把整页 / 视频缩窄(spec §7/§12 的满屏出血是用户明确选的,缩窄已经被否掉一次)。
+// jsdom 没有布局,这两条钉的是**声明出来的几何**(值对了、接线对了),像素要真机看。
+describe('FeedList 的状态浮层躲开左侧那条浮层导航', () => {
+  it('整屏居中的浮层(加载中 / 空 / 首屏失败)从侧栏右缘起画', () => {
+    const firstPage = deferred<Page>();
+    const load = vi.fn((_cursor?: FeedCursor) => firstPage.promise);
+    renderList(load);
+
+    const status = screen.getByTestId('feed-list-status');
+    // 200 = SIDEBAR_WIDTH(MainLayout 那条 fixed 导航的宽度)。浮层从 (0,0) 起的话,
+    // 375px 宽下居中的那行字正好压在导航底下 —— 可点的只剩一小截。
+    expect(status.style.left).toBe('200px');
+    expect(status.style.right).toBe('0px');
+
+    return act(async () => {
+      firstPage.resolve({ items: [], nextCursor: undefined });
+    });
+  });
+
+  it('已经有视频时失败那一小条也让位(同一个居中,同一种遮挡)', async () => {
+    const load = makeLoad([
+      { items: [makeItem(1)], nextCursor: CURSOR_A },
+      new Error('boom'),
+    ]);
+    renderList(load);
+    await flush();
+
+    await atTail();
+    await flush();
+
+    const status = screen.getByTestId('feed-list-status');
+    expect(status.style.left).toBe('200px');
+    expect(status.style.right).toBe('0px');
+    // 居中改成"在导航右边那一条里居中":原来的 translateX(-50%) 是按整宽居中,会钻到导航底下
+    expect(status.style.transform).toBe('');
+  });
+});
+
+// "没有更多了"的时机。
+//
+// 浮层钉在视口上 ⇒ 这行字一出现就压在**当前这一屏**上。最后一页完全可能有不止一条:
+// 一页 5 条、游标恰好用尽时,你还在看第 1 条,它就已经压在画面上了 —— 说的是"后面没有了",
+// 却出在你还没看的内容上。所以它现在受一道门:「用户到过尾部」之后才摆出来。
+//
+// 门有两个信号,OR 起来、而且一旦为真就不再回退(latch,浮层不许闪):
+//   ① 哨兵进过视口 —— 与"触底加载"同一个信号(容器里"到达尾部"只有一个概念);
+//   ② 滚动位置已经贴到底 —— 哨兵是列表末尾之后的 1px,而每一屏都正好一屏高,
+//      满屏吸附会把滚动位置拉回到最后一屏的顶边,哨兵于是卡在滚动区下沿**之外**;
+//      单靠 ①,这行字可能永远不出现(单条一页时更是连 1px 都拖不动)。
+//
+// —— 替身 3:滚动几何(按 DOM 里的屏数实时算) ——
+// jsdom 没有布局:scrollTop / clientHeight / scrollHeight 一律是 0,上面那个判定就恒为真
+// (0 + 0 >= 0 - 2),被测的会是巧合而不是逻辑。所以把这三条值装成"最接近真实布局"的样子:
+// 容器正好一屏高,每条视频也正好一屏,列表末尾那个 1px 哨兵也算进去 —— 屏数直接从 DOM 里数。
+// 这样连"首屏还没有内容时(滚动区里只有那个哨兵)不能算到底"都能被摆出来。
+// 诚实边界:它证明的是**判定与接线**(读哪三条值、什么时候读、latch 会不会回退、空列表算不算到底),
+// 不是"真实布局下到底对不对" —— 那要真机(task-11 走查清单第 2 条)。
+const SCREEN_PX = 720;
+const GEOMETRY_KEYS = ['scrollTop', 'clientHeight', 'scrollHeight'] as const;
+
+let scrollTopStub = 0;
+
+function stubListGeometry() {
+  scrollTopStub = 0;
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+    configurable: true,
+    get: () => SCREEN_PX,
+  });
+  Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+    configurable: true,
+    // 一条视频一屏,末尾再加那个 1px 哨兵 —— 从 DOM 里数,和真实布局同一套算法
+    get: () => document.querySelectorAll('[data-testid="feed-list-item"]').length * SCREEN_PX + 1,
+  });
+  Object.defineProperty(HTMLElement.prototype, 'scrollTop', {
+    configurable: true,
+    get: () => scrollTopStub,
+    set: (value: number) => {
+      scrollTopStub = value;
+    },
+  });
+}
+
+// jsdom 把这三个属性定义在 Element.prototype 上(实测),所以在 HTMLElement.prototype 上加一层
+// 自己的存取器就是"遮住它";删掉这层,继承下来的那份立刻回来(也是实测过的)。
+function unstubGeometry() {
+  for (const key of GEOMETRY_KEYS) {
+    delete (HTMLElement.prototype as unknown as Record<string, unknown>)[key];
+  }
+}
+
+const scroller = () => screen.getByTestId('feed-list');
+
+describe('到底那行字只在用户到过尾部之后才摆出来', () => {
+  beforeEach(() => {
+    stubListGeometry();
+  });
+
+  afterEach(() => {
+    unstubGeometry();
+  });
+
+  it('游标已经没了、但用户还在上面:先不摆这行字', async () => {
+    const load = makeLoad([{ items: [makeItem(1), makeItem(2)], nextCursor: undefined }]);
+    renderList(load);
+    await flush();
+
+    // "到底"这件事已经成立(游标缺失),但几何说还在最上面(两屏内容,位置 0)⇒ 不该多出一行字。
+    // 这一条同时守着"首屏还没有内容时**不算**到底":那一刻滚动区里只有哨兵,
+    // 任何容差下都"已经在底部" —— 若在挂载时就判,这道门等于不存在。
+    expect(screen.queryByText(END_TEXT)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('feed-list-status')).not.toBeInTheDocument();
+    // 有视频在屏上,该有的东西一个不少(这道门只影响那行字)
+    expect(screen.getAllByTestId('video-panel')).toHaveLength(2);
+  });
+
+  it('哨兵进过视口 ⇒ 摆出来;之后滑回去也不收回(latch,浮层不许闪)', async () => {
+    const load = makeLoad([{ items: [makeItem(1), makeItem(2)], nextCursor: undefined }]);
+    renderList(load);
+    await flush();
+
+    await atTail();
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
+
+    await notAtTail();
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
+  });
+
+  it('滚动位置已经贴到底 ⇒ 也摆出来(哨兵卡在滚动区下沿之外的兜底)', async () => {
+    const load = makeLoad([{ items: [makeItem(1), makeItem(2)], nextCursor: undefined }]);
+    renderList(load);
+    await flush();
+    expect(screen.queryByText(END_TEXT)).not.toBeInTheDocument();
+
+    // 摆出"已经滑到最后一屏"的滚动位置(2 屏内容 ⇒ 第二屏的顶边 = 1 × 720),并派发一次 scroll
+    await act(async () => {
+      scroller().scrollTop = SCREEN_PX;
+      fireEvent.scroll(scroller());
+    });
+
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
+  });
+
+  it('到底但一条都没有:空态文案不受这道门影响(屏幕上什么都没有,必须有话说)', async () => {
+    const load = makeLoad([{ items: [], nextCursor: undefined }]);
+    renderList(load);
+    await flush();
+
+    expect(screen.getByText(EMPTY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(END_TEXT)).not.toBeInTheDocument();
+  });
+});
+
+// 没有 IntersectionObserver 的环境(老浏览器 / 非浏览器):useInView 会一直回"不可见",
+// 哨兵于是永远不会触发 —— "触底加载"就没有任何自动入口了。首屏若恰好一条都没有、却还带着游标
+// (合法状态:本页候选被截断 / 窗口内的条目已失效),屏幕上就是一句永远的"加载中…",没有出口。
+// 所以那个状态必须有一个**手动**出口,而且它得是个真控件(键盘 / 读屏可达)。
+describe('没有 IntersectionObserver 的环境:触底加载有手动出口', () => {
+  // jsdom 本来就没有 IntersectionObserver;上面的 beforeEach 为了别的用例装了替身,
+  // 这里把它摘掉,退回那个环境(每个用例的 beforeEach 都会重新装上,不必在 afterEach 里还原)。
+  beforeEach(() => {
+    delete (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver;
+  });
+
+  it('首屏空、但游标还在:不是永远的"加载中…",而是一个点得到的出口', async () => {
+    const load = makeLoad([
+      { items: [], nextCursor: CURSOR_A },
+      { items: [makeItem(1)], nextCursor: undefined },
+    ]);
+    renderList(load);
+    await flush();
+
+    expect(screen.queryByText(LOADING_TEXT)).not.toBeInTheDocument();
+    const more = screen.getByRole('button', { name: MORE_TEXT });
+    expect(load).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(more);
+    await flush();
+
+    // 出口是真的:带着上一页给的游标把下一页要回来
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(load.mock.calls[1][0]).toEqual(CURSOR_A);
+    expect(screen.getByTestId('video-panel')).toBeInTheDocument();
+  });
+
+  it('已经有内容、游标还在:底部那一小条是"加载更多",点了继续往下拉', async () => {
+    const load = makeLoad([
+      { items: [makeItem(1)], nextCursor: CURSOR_A },
+      { items: [makeItem(2)], nextCursor: undefined },
+    ]);
+    renderList(load);
+    await flush();
+
+    await userEvent.click(screen.getByRole('button', { name: MORE_TEXT }));
+    await flush();
+
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(load.mock.calls[1][0]).toEqual(CURSOR_A);
+    expect(screen.getAllByTestId('video-panel')).toHaveLength(2);
+    // 游标用尽之后这个手动出口就该消失 —— 到底了,没有下一页可拉
+    expect(screen.queryByRole('button', { name: MORE_TEXT })).not.toBeInTheDocument();
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
   });
 });

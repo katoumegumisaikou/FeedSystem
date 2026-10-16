@@ -164,6 +164,30 @@ describe('ActionRail 的点赞接口接线', () => {
     expect(likeButton()).toHaveTextContent(/^3$/);
     expect(screen.queryByRole('dialog')).toBeNull();
   });
+
+  it('请求在飞时 aria-busy 为真:读屏也知道"这一下正在处理"', async () => {
+    // 这一态原来只在视觉上"什么都不发生"(连点会被忽略),读屏用户听到的是一按就没反应。
+    // aria-busy 是全局 ARIA 属性,给按钮就是"这个控件忙":读屏会把它播报出来。
+    let settle: (resp: LikeResp) => void = () => {};
+    likeVideoMock.mockReturnValue(
+      new Promise<LikeResp>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    renderRail();
+
+    expect(likeButton()).toHaveAttribute('aria-busy', 'false');
+
+    await userEvent.click(likeButton());
+    expect(likeButton()).toHaveAttribute('aria-busy', 'true');
+
+    await act(async () => {
+      settle({ is_like: true, likes_count: 4 });
+    });
+
+    // 落地之后必须回到"不忙",否则读屏会一直以为这次点击还在处理
+    expect(likeButton()).toHaveAttribute('aria-busy', 'false');
+  });
 });
 
 describe('ActionRail 的评论格(后端没有评论模块)', () => {

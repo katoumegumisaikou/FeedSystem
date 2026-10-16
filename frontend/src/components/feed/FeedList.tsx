@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useInView } from '../../hooks/useInView';
-import { spacing } from '../../theme/tokens';
+import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 import ActionRail from './ActionRail';
 import VideoPanel from './VideoPanel';
@@ -9,6 +9,16 @@ import VideoPanel from './VideoPanel';
 const LOADING_TEXT = '加载中…';
 const ERROR_TEXT = '加载失败,点此重试';
 const END_TEXT = '没有更多了';
+
+// 第五句文案,Task 11 新增:**没有 IntersectionObserver 的环境**下手动出口上的那句话。
+// 为什么非加不可:那种环境里 useInView 一直回"不可见",哨兵永远不触发 —— 首屏若恰好
+// 一条都没有、却还带着游标(合法状态),屏幕上就是一句永远的"加载中…",没有任何出路。
+// 一个动词(加载)+ 一个对象(更多),不用"OK / 确定"这类什么都没说的词。
+const MORE_TEXT = '加载更多';
+
+// "滚动位置贴到底"的容差(px):scrollTop / clientHeight 在浏览器里会被取整,亚像素滚动、
+// 设备像素比 1.25 / 1.5 的屏幕上都会带来 ±1px 的误差;留 2px 才不会把"到底"判丢。
+const TAIL_SLACK_PX = 2;
 
 // 与 VideoPanel / ActionRail / FollowButton 同一份深色浮层配色(见 ActionRail.tsx 顶部):
 // 浮层里的颜色各处各写一遍,深浅就不一致了 —— 这里只用已经存在的四个值,不新造第五个。
@@ -63,6 +73,17 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
   // 0.6 要求它六成进视口,而满屏吸附(scroll-snap)下,滑到最后一屏时它正好卡在视口边界上,
   // 那就永远等不到"触底"。0.6 的语义属于 VideoPanel("六成进画面才算在看它"),不是这里。
   const [sentinelRef, sentinelInView] = useInView<HTMLDivElement>({ threshold: 0 });
+
+  // 这个环境里有没有 IntersectionObserver —— 判据是"渲染这一刻"有没有,所以刻意写在组件里
+  // (不是模块顶层的常量):模块顶层只会算一次(导入那一刻),而环境是可以在运行期变的
+  // (浏览器扩展、测试替身)。没有它的环境里哨兵永远不会触发,"触底加载"就只剩手动这一条路。
+  const canObserve = typeof IntersectionObserver !== 'undefined';
+
+  // 「用户到过列表尾部了吗」—— 只用来决定"没有更多了"那行字什么时候摆出来(见下)。
+  // 一旦为真就不再回退:浮层是钉在视口上的,出现又消失地闪一下比晚一点出现难受得多。
+  const [reachedTail, setReachedTail] = useState(false);
+  // 滚动容器:既是被观察的滚动位置,也是"贴到底"那个判定的读点。
+  const scrollerRef = useRef<HTMLDivElement>(null);
 
   // 并发保护的第一道闸:在飞的请求没回来,谁都不许再发。
   // 用 ref 而不是读 loading 这个 state:state 的更新是异步的,同一帧里连续两次触发
@@ -121,29 +142,82 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
     void loadPage(cursor);
   }, [sentinelInView, loading, failed, done, cursor, loadPage]);
 
-  // 三态归一。优先级:加载中 > 失败 > 到底 —— 重试在飞的时候应该显示"加载中…",
-  // 而不是继续摆着"加载失败"(那条提示此刻已经过期了)。
+  // "没有更多了"为什么需要一道门:
+  // 状态浮层挂在滚动容器**外面**(见下面那处注释),所以它钉在视口上 —— 这行字一出现就压在
+  // **当前这一屏**上。而"到底"完全可能在你还看着前面的内容时就成立(一页 5 条、游标恰好用尽),
+  // 于是这行字会一直压在一条你还没看完的视频上。它说的是"后面没有了",不该出现在你还没看的内容上。
+  //
+  // 门有两条信号,OR 起来(任一条成立就算到过尾部):
+  //   ① 哨兵进过视口 —— 与"触底加载"同一个信号。容器里"到达尾部"只有一个概念,不新造第二个。
+  //   ② 滚动位置已经贴到底 —— 为什么非有它不可:哨兵是**列表末尾之后**那 1px,而每一屏都正好
+  //      一屏高、吸附又是对齐到顶边的,滚到底时吸附会把位置拉回最后一屏的顶边,哨兵正好卡在
+  //      滚动区下沿**之外**,只有手指还在拖、位置还没被拉回的那一瞬它才真的进视口。
+  //      只靠 ①,这行字可能永远不出现(单条一页时更是连 1px 都拖不动)。
+  useEffect(() => {
+    if (sentinelInView) setReachedTail(true);
+  }, [sentinelInView]);
+
+  // ② 的实现:读滚动容器的三条几何值,贴到底(容差见 TAIL_SLACK_PX)就置真。
+  // 挂载时先判一次 —— 内容不足一屏时(单条一页)根本没有滚动,这一刻就已经在底部;
+  // 每追加一页后重判一次(items.length 在依赖里);再挂 scroll(滚动中)与 resize
+  // (旋转屏幕 / 拉窗口会改 clientHeight,可能"变到底了"却不产生任何 scroll 事件)。
+  // passive: 这个监听什么都不拦,滚动线程不该为它等主线程。
+  useEffect(() => {
+    const el = scrollerRef.current;
+    // 一条都没有的时候**不判**:此刻滚动区里只有那个 1px 哨兵,任何容差下都"已经在底部",
+    // 挂载那一刻就会把这道门打开 —— 那这道门就等于不存在(首屏还没回来时尤其如此)。
+    if (!el || items.length === 0) return;
+
+    const nearBottom = () => {
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - TAIL_SLACK_PX) setReachedTail(true);
+    };
+    nearBottom();
+    el.addEventListener('scroll', nearBottom, { passive: true });
+    window.addEventListener('resize', nearBottom);
+    return () => {
+      el.removeEventListener('scroll', nearBottom);
+      window.removeEventListener('resize', nearBottom);
+    };
+  }, [items.length]);
+
+  // 状态归一。优先级:加载中 > 失败 > 到底 > (没有观察者时的)手动出口 > 空。
+  // 重试 / 继续加载在飞的时候应该显示"加载中…",而不是继续摆着上一条提示(它此刻已经过期了)。
   const empty = items.length === 0;
-  const state: 'loading' | 'error' | 'end' | null = loading
+  // 还有下一页,可这个环境没人能自动去要它(没有 IntersectionObserver ⇒ 哨兵永不触发)。
+  // 这一态必须给出口:否则首屏恰好是"空页 + 有游标"时,屏幕上就是一句永远的"加载中…"。
+  const manualOnly = !canObserve && !loading && !failed && !done;
+  // 到底,但用户还没到过尾部 ⇒ 先不摆(见上面那两段注释)。注意 `empty` 不受这道门影响:
+  // 一条都没有的时候屏幕上必须有话说,空态文案不摆出来就真的是一片空了。
+  const atEnd = done && (empty || reachedTail);
+  const state: 'loading' | 'error' | 'end' | 'manual' | null = loading
     ? 'loading'
     : failed
       ? 'error'
       : done
-        ? 'end'
-        : // 一条都没有、也还没到底:屏幕上此刻什么都没有,而容器确实还在往下一段走
-          // (等哨兵把下一页拉起来)。这一帧显示"加载中…"比留一片黑诚实 ——
-          // 首屏那一帧,以及 IntersectionObserver 不可用的环境,都会落到这里。
-          empty
-          ? 'loading'
-          : null;
+        ? atEnd
+          ? 'end'
+          : null
+        : manualOnly
+          ? 'manual'
+          : // 一条都没有、也还没到底:屏幕上此刻什么都没有,而容器确实还在往下一段走
+            // (等哨兵把下一页拉起来)。这一帧显示"加载中…"比留一片黑诚实 —— 首屏那一帧会落到这里。
+            empty
+            ? 'loading'
+            : null;
 
   const stateContent =
     state === 'loading' ? (
       LOADING_TEXT
     ) : state === 'error' ? (
       // 整条文案就是按钮:点哪儿都能重试,不用去瞄那几个字。
-      <button type="button" data-testid="feed-list-retry" onClick={() => void loadPage(cursor)} style={retryStyle}>
+      <button type="button" data-testid="feed-list-retry" onClick={() => void loadPage(cursor)} style={statusButtonStyle}>
         {ERROR_TEXT}
+      </button>
+    ) : state === 'manual' ? (
+      // 没有 IntersectionObserver 的环境:哨兵永远不会触发,所以把"触底加载"这件事的出口
+      // 显式做出来 —— 一个真按钮(可聚焦、有名字、键盘可达),而不是一句永远的"加载中…"。
+      <button type="button" data-testid="feed-list-more" onClick={() => void loadPage(cursor)} style={statusButtonStyle}>
+        {MORE_TEXT}
       </button>
     ) : empty ? (
       // 一条都没有而且确实没有下一页 —— 这才是空态。emptyText 由三个页面各自给
@@ -156,8 +230,9 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
   return (
     <div data-testid="feed-list-root" style={rootStyle}>
       {/* 滚动容器:一屏一个面板,y 轴吸附。吸附权归这里 —— VideoPanel 的注释把 scroll-snap
-          明确留给了外层列表容器(它自己只管撑满一屏 + 撑多高)。 */}
-      <div data-testid="feed-list" style={scrollerStyle}>
+          明确留给了外层列表容器(它自己只管撑满一屏 + 撑多高)。
+          className 只为一件事:把滚动条本身藏掉(规则在 feed.css,伪元素 inline 表达不了)。 */}
+      <div ref={scrollerRef} data-testid="feed-list" className="feed-scroller" style={scrollerStyle}>
         {items.map((item) => (
           // key 用视频 id(稳定),不用下标 —— 追加 / 删除时下标会让 React 错认元素,
           // 上一条的点赞态就会留在新的一条上。
@@ -190,8 +265,9 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
         <div
           data-testid="feed-list-status"
           // 加载中 / 到底 是对读屏的状态播报(role=status 隐含 aria-live="polite");
-          // 错误态里是一个真按钮,由按钮自己说话,别让容器再报一遍。
-          role={state === 'error' ? undefined : 'status'}
+          // 失败态与"没有观察者"态里都是一个真按钮,由按钮自己说话(它有名字、能聚焦),
+          // 别让容器再报一遍 —— 也不该把一个可聚焦控件塞进 live region 里。
+          role={state === 'error' || state === 'manual' ? undefined : 'status'}
           style={empty ? fullScreenStatusStyle : tailStatusStyle}
         >
           {stateContent}
@@ -202,12 +278,13 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
 }
 
 // 沉浸底 + 自己撑满一屏:不依赖父容器高度(父容器若是 auto 高,height:100% 会算成 0,
-// 整块塌掉 —— 与 VideoPanel 同一条理由、同一套口径,两处必须是同一个值)。
-// 100dvh 跟着移动端地址栏伸缩,老浏览器忽略 maxHeight 就退回 100vh。
+// 整块塌掉 —— 与 VideoPanel 同一条理由、同一套口径)。
+// 高度本身取 theme/tokens.ts 的 FULL_VIEWPORT_HEIGHT(那一对值的理由写在那儿,只此一份)。
 const rootStyle: CSSProperties = {
   position: 'relative',
-  height: '100vh',
-  maxHeight: '100dvh',
+  // 与 MainLayout 的外壳、VideoPanel 的面板**同一个定义**:三者必须相等 —— 面板是一屏一屏
+  // 吸附的,任何一处差一条,视频就会跟它所在的那一屏错开、底部露出一条底色。
+  ...FULL_VIEWPORT_HEIGHT,
   width: '100%',
   // 浮层要钉在视口上而不是被内容顶开,所以溢出在这里截断,滚动交给里面那层
   overflow: 'hidden',
@@ -217,6 +294,9 @@ const rootStyle: CSSProperties = {
 const scrollerStyle: CSSProperties = {
   height: '100%',
   overflowY: 'auto',
+  // 滚动条本身由 .feed-scroller(feed.css)藏掉:classic 滚动条会在滚动区里侧占掉约 15px,
+  // 于是视频右缘之外露出一条底色 —— "满屏出血"只是近似。滚动行为全留在这里(滚轮 / 触摸 /
+  // 键盘 / 吸附一样不少),只是不再有一条占版面的滑块。
   // 滑一下正好落在下一个面板的顶边(抖音式)。不用 proximity:满屏流要的是"一定对齐",
   // proximity 在"差得远"时会放弃吸附,滑完停在两屏中间就是画面被切成两半。
   scrollSnapType: 'y mandatory',
@@ -238,15 +318,26 @@ const SENTINEL_STYLE: CSSProperties = {
 // 此刻屏幕上没有视频,提示就是全部内容。
 const fullScreenStatusStyle: CSSProperties = {
   position: 'absolute',
-  inset: 0,
+  top: 0,
+  right: 0,
+  bottom: 0,
+  // 左边让开那条浮层导航(MainLayout 里 fixed 的 SIDEBAR_WIDTH):这个浮层是按**自己的盒子**
+  // 居中的,盒子从视口最左起画的话,窄屏(375px)下居中的那行字正好压在导航底下 ——
+  // 而那行字里就是"点此重试",只露一小截可点的等于死路。
+  // 为什么不是"整页缩窄":视频必须铺满可视区(spec §7/§12,用户明确选的几何),缩窄已被否掉一次。
+  left: SIDEBAR_WIDTH,
   display: 'flex',
   alignItems: 'center',
   justifyContent: 'center',
-  padding: spacing.xl,
+  // 24 而不是 36:盒子让开导航之后窄屏只剩 175px 宽,36 的两侧内边距会把文案挤成两行
+  // (重试按钮的文案 9 个字 ≈117px)—— 24 是刻度上的下一档,放得下整条。
+  padding: spacing.lg,
   textAlign: 'center',
   color: TEXT_SECONDARY,
   fontSize: 14,
-  // 浮层本身不吃点击(它盖着整屏),但里面的重试按钮自己把 pointer-events 打开。
+  // 整条文案都可能比盒子宽(长空态文案),长单词 / 长串不该顶破浮层。
+  overflowWrap: 'anywhere',
+  // 浮层本身不吃点击(它盖着整屏),但里面的重试 / 继续加载按钮自己把 pointer-events 打开。
   pointerEvents: 'none',
 };
 
@@ -256,8 +347,12 @@ const tailStatusStyle: CSSProperties = {
   // 贴到 4px:VideoPanel 左下角的信息块是从底边 36px 起画的(它自己的 padding),
   // 压到 4px 就不会盖在那几行字上;右侧操作栏在右半边,居中的小条也碰不到它。
   bottom: spacing.xxs,
-  left: '50%',
-  transform: 'translateX(-50%)',
+  // 同样让开左侧浮层导航:原来是 left:50% + translateX(-50%),那是按**整宽**居中 ——
+  // 窄屏下这一条会从左半边起画,压在导航底下。改成"在导航右边那一条里居中"(left + right + auto 外边距)。
+  left: SIDEBAR_WIDTH,
+  right: 0,
+  marginLeft: 'auto',
+  marginRight: 'auto',
   maxWidth: '80%',
   display: 'flex',
   alignItems: 'center',
@@ -271,14 +366,17 @@ const tailStatusStyle: CSSProperties = {
   borderRadius: 8,
   color: TEXT_SECONDARY,
   fontSize: 13,
+  overflowWrap: 'anywhere',
   pointerEvents: 'none',
 };
 
-const retryStyle: CSSProperties = {
+// 状态浮层里那两个真按钮("加载失败,点此重试" / "加载更多")共用一份样式:
+// 它们出现在同一个位置、承担同一件事(把路走下去),长得不一样只会让人以为是两种东西。
+const statusButtonStyle: CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
   // 触摸目标给到 44(与 ActionRail 48 的 SLOT_MIN_SIZE 同一个理由):文案只有 13px,
-  // 不留够可点面积,手指就点不中 —— 而"点此重试"恰恰是失败之后唯一的出路。
+  // 不留够可点面积,手指就点不中 —— 而这是失败 / 没有观察者时唯一的出路。
   minHeight: 44,
   // 压在视频上的字:主文字色(与 VideoPanel / ActionRail 同一份)
   color: TEXT_PRIMARY,

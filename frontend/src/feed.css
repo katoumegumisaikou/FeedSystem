@@ -1,0 +1,80 @@
+/* feed 页面里"只能用样式表表达"的那几条规则。
+ *
+ * 为什么要单开一个文件(而不是并进 index.css 的那份全局 reset):
+ * 下面每条都挂在 feed 外壳的类名(.feed-surface)上,和它服务的组件一起被 review;
+ * index.css 只管"整份文档的复位",两件事分开,谁也别在对方文件里顺手加东西。
+ *
+ * 为什么非有这几条不可(inline style 做不到):
+ *   ① :focus-visible / :hover 是**伪类**;
+ *   ② ::-webkit-scrollbar 是**伪元素**;
+ *   ③ @media(prefers-reduced-motion / hover)是**媒体查询**。
+ * 颜色一律取已有 token(#0b0b0f / #16161c / #f5f5f7 / #2c2c36 / #1c1c24),不新造。
+ *
+ * 诚实边界:jsdom 不跑样式表,这几条的效果只能在真机 / 真浏览器上看(见 task-11 走查清单)。
+ */
+
+/* ① 焦点环。
+ *
+ * feed 面上一大半控件是"压在视频上"的(导航入口 / 声音开关 / 点赞 / 关注 / 重试),
+ * 浏览器默认那圈焦点环在亮画面上会被吃掉 —— 而它们恰恰是键盘用户唯一的入口。
+ * 所以给一条明确的环:2px、离元素 2px(不贴边,免得被 overflow:hidden 裁掉)、
+ * 颜色取深色 token 的主文字 #f5f5f7(在沉浸底 #0b0b0f 上 16.5:1)。
+ *
+ * 为什么不是 :focus:鼠标点一下也亮一圈是噪音;:focus-visible 只在键盘 / 无指针设备上亮。
+ * 任何地方都不写 outline: none —— 不写就等于没关掉浏览器的默认环,这才是底线。 */
+.feed-surface :focus-visible {
+  outline: 2px solid #f5f5f7;
+  outline-offset: 2px;
+}
+
+/* ② 导航入口的悬停态。
+ *
+ * 文字色是组件里 inline 给的(当前页 / 非当前页各一档),inline 优先于样式表,所以这里只动底色。
+ * #1c1c24 是 colorBgElevated —— token 里已有的值,与"当前页"同一档面。
+ * 当前页那一项自己已经有 inline 底色,hover 对它不生效:悬在"我已经在这一页"的入口上不该有额外反馈。
+ * 包在 @media (hover: hover) 里:触摸屏上 hover 会粘在最后碰过的那一项上,不是反馈而是残留。 */
+@media (hover: hover) {
+  .feed-nav-link:hover {
+    background: #1c1c24;
+  }
+}
+
+/* ③ 按下态(Active)。
+ *
+ * 压在视频上的圆形 / 图标控件没有背景可以换色,按下的反馈只能靠一点点形变。
+ * 只动 transform:不会触发布局,也不会让压在画面上的东西跳位置。 */
+.feed-surface button:active {
+  transform: scale(0.94);
+}
+
+/* 形变给一个短过渡(120ms,出得快才像"按下",不像"飘过去")。 */
+.feed-surface button {
+  transition: transform 120ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 动效不是可选项。用户说了"别晃"就不晃:按下时那个形变**保留**(它是离散的状态变化,
+   * 不是动),只是不再"动"出来 —— 所以这里去掉的是过渡,不是反馈本身。 */
+  .feed-surface button {
+    transition: none;
+  }
+}
+
+/* ④ 滚动条(FeedList 的滚动容器)。
+ *
+ * 它用 overflow-y: auto:在 classic(非 overlay)滚动条的系统上,滚动条会占掉滚动区里侧约 15px,
+ * 于是视频右缘之外露出一条约 15px 的沉浸底 —— "满屏出血"只是近似。
+ * 试过的替代都不行:
+ *   · scrollbar-gutter: stable —— 只是把这条缝**永久**留下来(还多占一次版面),缝本身没消;
+ *   · overflow-y: overlay —— 非标准,Chromium 114 起已移除,Firefox / Safari 从来没有;
+ *   · 让整页 / 视频缩窄 —— 用户明确要的是满屏出血,已被否掉一次。
+ * 所以把滚动条本身藏掉(满屏流的通行做法)。滚动行为一点没变:滚轮 / 触摸 / 键盘 / 吸附全在,
+ * 只是不再有一条占版面的滑块。代价(记在走查清单里):桌面上少了一个"这里能滚"的可见提示。 */
+.feed-scroller {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* 老的 Edge / IE */
+}
+
+.feed-scroller::-webkit-scrollbar {
+  display: none; /* WebKit / Blink */
+}

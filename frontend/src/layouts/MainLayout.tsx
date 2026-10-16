@@ -2,11 +2,11 @@ import { useEffect, useState, type CSSProperties } from 'react';
 import { ConfigProvider, theme } from 'antd';
 import { NavLink, Outlet } from 'react-router-dom';
 import { getMyProfile } from '../api/auth';
-import { SIDEBAR_WIDTH, darkTokens, spacing } from '../theme/tokens';
+import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, darkTokens, spacing } from '../theme/tokens';
 import type { UserResp } from '../types/auth';
 
-/** 入口高度:与 FeedList 的"点此重试"(44)、ActionRail 的槽位(48)同一个理由 ——
- *  文字才 15px,不留够可点面积,手指点不中。 */
+/** 入口高度:与 FeedList 的"点此重试"(44)、ActionRail 的槽位(48)、VideoPanel 的声音开关(44)
+ *  同一个理由 —— 文字才 16px,不留够可点面积,手指点不中。 */
 const ENTRY_MIN_HEIGHT = 44;
 
 // feed 页面的外壳:左侧栏 + 内容区。
@@ -80,7 +80,10 @@ function Shell() {
     fontSize: 16,
     fontWeight: isActive ? 600 : 400,
     textDecoration: 'none',
-    background: isActive ? token.colorBgElevated : 'transparent',
+    // 底色只在"当前页"这里 inline 给;非当前页留给样式表的 hover(feed.css 的 .feed-nav-link:hover)。
+    // 为什么非要让出来:inline 样式优先于样式表,写死成 'transparent' 的话那条 hover 规则永远不会生效。
+    // 悬停只动底色(文字色被上面的 inline 钉着,改不了,也不必改:整行提亮一档就是导航最标准的 hover 反馈)。
+    background: isActive ? token.colorBgElevated : undefined,
     // 当前页的标记:品牌色竖条 + 亮一档的面 + 加粗。
     // 为什么不是"只换个背景色":#16161c → #1c1c24 只差一档,单靠它太弱,颜色之外还必须有形状。
     // 为什么用 box-shadow 的 inset 而不是 border-left:后者会占宽度、把文字推走,四个入口的字就不对齐了。
@@ -90,7 +93,9 @@ function Shell() {
   return (
     // 沉浸底取自 token,不写字面量:内容区若只有半屏内容(空态 / 错误态),
     // 露出来的必须是这个近黑底 —— 来源和别处一样,只有 darkTokens 一处。
-    <div style={{ ...rootStyle, background: token.colorBgLayout }}>
+    // className=feed-surface 是"这一面"的挂点:焦点环 / 悬停 / 滚动条那几条只能写在样式表里的规则
+    // (伪类、伪元素、媒体查询 inline 表达不了)都挂在它下面,见 feed.css。
+    <div className="feed-surface" style={{ ...rootStyle, background: token.colorBgLayout }}>
       <nav
         aria-label="主导航"
         style={{
@@ -106,6 +111,7 @@ function Shell() {
             // 只有主页给 true。不传时 NavLink 走的是模糊匹配 —— 对 "/" 来说那等于
             // "我在任何路径下都算当前页",高亮就废了(见上面 entries 里的注释)。
             end={entry.end}
+            className="feed-nav-link"
             style={({ isActive }) => entryStyle(isActive)}
           >
             {entry.label}
@@ -121,12 +127,21 @@ function Shell() {
 }
 
 // 外壳:内容区自己撑满一屏,左侧导航**浮在它上面**(spec §7 / §12 的"满屏出血")。
-// 高度写成 100vh + maxHeight:100dvh 这一对,理由与 VideoPanel / FeedList 相同 ——
-// 移动端带地址栏时 100vh 比真正看得见的高度大,只有 dvh 跟着地址栏伸缩。
+// 高度来自 theme/tokens.ts 的 FULL_VIEWPORT_HEIGHT —— 与 FeedList 的根、VideoPanel 的面板
+// 同一个定义,三处必须相等(理由写在那个常量上)。
+//
+// 导航的响应式收起:Task 11 **明确决定不做**(不是漏掉的)。375px 视口下它确实占掉 200px(53%),
+// 但:① 它自己每一项都是 44px 高、整宽可点,四个入口在该宽度下都点得到,没有"够不着"的东西;
+// ② 任何真正的收起方案(收成底部栏 / 图标条 / 汉堡抽屉)都会**作废两条已被复审批准的几何**:
+//    视频满屏出血 + 导航浮在其上、以及 VideoPanel 左下角文字那 216px 的左避让 —— 后者假设的正是
+//    "左边有一条 200px 的导航",收起之后那 216px 就变成一块空白(窄屏上更明显);
+// ③ 本环境没有浏览器,收起的像素结果无法验证,猜错就是把布局改坏。
+// 所以它留给真机走查后的后续任务,处理方式(在 ≤767px 收成底部栏 + VideoPanel 左避让随之降到
+// spacing.md)与代价都写在 task-11 报告的走查清单里 —— 那是一个需要同时改三个文件的几何决定,
+// 不是收尾能顺手带过的。
 const rootStyle: CSSProperties = {
   position: 'relative',
-  height: '100vh',
-  maxHeight: '100dvh',
+  ...FULL_VIEWPORT_HEIGHT,
   width: '100%',
   overflow: 'hidden',
 };

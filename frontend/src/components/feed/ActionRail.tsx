@@ -135,11 +135,14 @@ export default function ActionRail({ video }: ActionRailProps) {
       </Link>
 
       {/* 2. 点赞 → 真接口。aria-pressed 表达"赞没赞"这个开关状态;
-          名字里带上当前计数 —— aria-label 一存在,里面那个数字就不会被单独念出来。 */}
+          名字里带上当前计数 —— aria-label 一存在,里面那个数字就不会被单独念出来。
+          aria-busy 表达"这一下正在处理":请求在飞时连点会被忽略(见上面的 pending),
+          视觉上也只降一点不透明度 —— 读屏至少要知道事情在走,而不是一按什么都没发生。 */}
       <button
         type="button"
         data-testid="action-rail-like"
         aria-pressed={isLiked}
+        aria-busy={pending}
         aria-label={`${isLiked ? '取消点赞' : '点赞'}，当前 ${likesCount} 个赞`}
         onClick={handleLike}
         style={{
@@ -148,6 +151,8 @@ export default function ActionRail({ video }: ActionRailProps) {
           border: 'none',
           background: 'none',
           cursor: 'pointer',
+          // 在飞时淡一档:与 FollowButton 的禁用态同一个手法(不新造颜色),读屏那边由 aria-busy 兜住
+          opacity: pending ? 0.7 : 1,
           // 图标用 currentColor → 与它下面的数字同色,不用给图标再指定一次颜色
           color: TEXT_PRIMARY,
         }}

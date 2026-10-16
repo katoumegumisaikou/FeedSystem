@@ -13,7 +13,10 @@ const SURFACE = '#2c2c36';
 // 点一下按钮就左右弹一下,看着像页面抖了。48 是 ActionRail 的 SLOT_MIN_SIZE(触摸目标),
 // 这里取更宽的 64 是为了同时容下两种文案。
 const MIN_WIDTH = 64;
-const MIN_HEIGHT = 32;
+// 44:与 ActionRail 的槽位(48)、FeedList 的"点此重试"(44)、外壳的导航入口(44)、
+// VideoPanel 的声音开关(44)同一把尺子 —— 压在视频上的小控件点不中的代价,比"看起来大一点"高。
+// (原来是 32。这个高度也是它在右侧栏里的占位高度,与上面那几格的 48 不再差一截。)
+const MIN_HEIGHT = 44;
 
 const baseStyle: CSSProperties = {
   display: 'inline-flex',

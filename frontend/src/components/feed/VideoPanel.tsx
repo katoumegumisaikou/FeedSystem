@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Typography } from 'antd';
 import { useInView } from '../../hooks/useInView';
-import { SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
+import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 
 // 深色 token 里的文字色,与 theme/tokens.ts 的 colorText / colorTextSecondary 同一个值。
@@ -9,6 +9,28 @@ import type { FeedItem } from '../../types/feed';
 // 不能依赖外层恰好套了深色 --- 一旦它落在浅色子树里,antd 会给近黑文字压在暗遮罩上,等于白写。
 const TEXT_PRIMARY = '#f5f5f7';
 const TEXT_SECONDARY = '#a1a1aa';
+
+// 与 ActionRail 的计数、FollowButton 的浅底按钮同一个来源(#0b0b0f):压在视频上的文字
+// 不能只赌"这一段遮罩恰好够暗"。画面亮起来时,一层与遮罩同源的暗影把笔画边缘压回可读 ——
+// 不新造颜色,与浮层里的其它文字同一套做法。
+const TEXT_SHADOW = '0 1px 2px rgba(11, 11, 15, 0.9)';
+
+// 声音开关的触摸目标:44×44。圆形视觉只有 40px 时,手指是点不中的(与 ActionRail 的 48、
+// FeedList 的"点此重试" 44、外壳入口的 44 同一把尺子)。
+const MUTE_BUTTON_SIZE = 44;
+
+/** 长文案的截断:最多 lines 行,超出给省略号。
+ *
+ *  为什么必须截:左下角这块文字是**从底边往上长**的,越长越往上顶 —— 顶过遮罩那段渐变
+ *  就变成"亮字压亮画面"(矮视口 + 长描述尤其明显)。给了上限,这块的高度就是有界的。
+ *  为什么是 -webkit-box + line-clamp:这是目前唯一能"截断并给省略号"的做法;
+ *  max-height + overflow:hidden 会把一行字从中间切掉,连个提示都没有。 */
+const clampLines = (lines: number): CSSProperties => ({
+  display: '-webkit-box',
+  WebkitBoxOrient: 'vertical',
+  WebkitLineClamp: lines,
+  overflow: 'hidden',
+});
 
 export interface VideoPanelProps {
   video: FeedItem;
@@ -81,11 +103,11 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
         // 自己撑满一屏,不依赖父容器高度:父容器若是 auto 高,height:100% 会算成 0,
         // 视频整块塌掉。滚动的吸附(scroll-snap)由外层的列表容器管,不归这里。
         //
-        // 100vh 是"大视口"高 —— 移动端浏览器带地址栏时,它比真正看得见的高度大,
-        // 底部那排(作者名 / 操作栏)会被压到地址栏下面。100dvh 是动态视口高,跟着地址栏伸缩;
-        // 不支持 dvh 的老浏览器忽略 maxHeight,自然退回 100vh。
-        height: '100vh',
-        maxHeight: '100dvh',
+        // 高度与外壳 / FeedList 的根**同一个定义**(theme/tokens.ts 的 FULL_VIEWPORT_HEIGHT):
+        // 三者必须相等,差一条就意味着面板和它所在的那一屏错开。
+        // 100vh 是"大视口"高 —— 移动端带地址栏时它比真正看得见的高度大,底部那排会被压到
+        // 地址栏下面;100dvh 跟着地址栏伸缩,不支持 dvh 的老浏览器忽略 maxHeight 退回 100vh。
+        ...FULL_VIEWPORT_HEIGHT,
         width: '100%',
         overflow: 'hidden',
         // 首帧解出来之前 / 加载失败时的底色,别让画面露白
@@ -126,8 +148,8 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           position: 'absolute',
           right: spacing.md,
           top: spacing.md,
-          width: 40,
-          height: 40,
+          width: MUTE_BUTTON_SIZE,
+          height: MUTE_BUTTON_SIZE,
           borderRadius: 999,
           border: 'none',
           cursor: 'pointer',
@@ -142,7 +164,9 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
 
       {/* 底部整条渐变遮罩:从沉浸底 #0b0b0f 渐变到透明。
           文字和右侧操作栏都落在这条带上,所以它是"浮层可读"的地基 —— 画面亮起来时
-          白字直接压上去是读不清的。 */}
+          白字直接压上去是读不清的。
+          另外两道保险(都在下面这块文字自己身上):与遮罩同源的文字暗影,以及标题 / 描述的
+          限行 —— 这块文字是从底边往上长的,限了行,它的高度才有界,不会顶到渐变很淡的那一段。 */}
       <div
         data-testid="video-panel-scrim"
         style={{
@@ -176,16 +200,20 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           display: 'flex',
           flexDirection: 'column',
           gap: spacing.xxs,
+          // 长串(没有空格的地址 / 连续英文)不该顶破这块 —— 中文自己会换行,这条是给它们兜底的。
+          overflowWrap: 'anywhere',
         }}
       >
-        <Typography.Text strong style={{ color: TEXT_PRIMARY, fontSize: 16 }}>
+        <Typography.Text strong style={{ ...clampLines(1), color: TEXT_PRIMARY, fontSize: 16, textShadow: TEXT_SHADOW }}>
           @{video.username}
         </Typography.Text>
-        <Typography.Text style={{ color: TEXT_PRIMARY, fontSize: 14 }}>
+        {/* 标题两行 / 描述三行封顶:这块文字从底边往上长,不限行就会顶到遮罩变淡的那一段上
+            (矮视口 + 长描述尤其明显),白字压亮画面等于读不清。 */}
+        <Typography.Text style={{ ...clampLines(2), color: TEXT_PRIMARY, fontSize: 14, textShadow: TEXT_SHADOW }}>
           {video.title}
         </Typography.Text>
         {video.description && (
-          <Typography.Text style={{ color: TEXT_SECONDARY, fontSize: 13 }}>
+          <Typography.Text style={{ ...clampLines(3), color: TEXT_SECONDARY, fontSize: 13, textShadow: TEXT_SHADOW }}>
             {video.description}
           </Typography.Text>
         )}

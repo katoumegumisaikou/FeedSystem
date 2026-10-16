@@ -191,4 +191,14 @@ describe('FollowButton 的可达性', () => {
     // 可见文字就是可访问名(标签与名字一致,读屏念的和眼睛看到的不会打架)
     expect(screen.getByRole('button', { name: '已关注' })).toBe(button());
   });
+
+  it('触摸目标给到 44 高:视觉上仍是一个小药丸,可点面积不小到手指点不中', async () => {
+    listFolloweesMock.mockResolvedValue({ followee_ids: [], limit: 5000 });
+    await renderLoaded(77);
+
+    // 原来 32 —— 与 ActionRail 的槽位(48)、FeedList 的"点此重试"(44)、外壳的导航入口(44)、
+    // 声音开关(44)不是一把尺子。这块是压在视频上的小控件,点不中的代价比"看起来大一点"高。
+    // (jsdom 没有布局:钉的是**声明出来的**尺寸;真机上手指够不够得着要看 task-11 的走查。)
+    expect(button()).toHaveStyle({ minHeight: '44px', minWidth: '64px' });
+  });
 });

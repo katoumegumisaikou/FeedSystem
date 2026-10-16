@@ -147,3 +147,31 @@ describe('MainLayout 的侧栏浮在内容之上(满屏出血)', () => {
     expect(getComputedStyle(nav).position).toBe('fixed');
   });
 });
+
+describe('MainLayout 的"一屏"与样式挂点', () => {
+  it('根容器撑满一屏:与 FeedList 的根 / VideoPanel 的面板同一对值', () => {
+    getMyProfileMock.mockRejectedValue(new Error('401'));
+
+    const { container } = renderLayout();
+
+    // 三处(外壳 / 流的根 / 单个面板)的高度**必须相等** —— 面板是一屏一屏吸附的,
+    // 差一条就意味着视频跟它所在的那一屏错开、底部露出一条底色。
+    // 它们的唯一定义现在在 theme/tokens.ts 的 FULL_VIEWPORT_HEIGHT 里(原来三份手写)。
+    // 这条与 FeedList.test / VideoPanel.test 里那两条一起,把三个消费者钉在同一对值上。
+    const root = container.firstChild as HTMLElement;
+    expect(root.style.height).toBe('100vh');
+    expect(root.style.maxHeight).toBe('100dvh');
+  });
+
+  it('根容器与导航入口挂着样式表的钩子(焦点环 / 悬停那几条规则靠它生效)', () => {
+    getMyProfileMock.mockRejectedValue(new Error('401'));
+
+    const { container } = renderLayout();
+
+    // jsdom 不跑样式表:这里钉的是"钩子还在" —— 类名一掉,feed.css 里那几条规则就是死代码。
+    expect(container.firstChild).toHaveClass('feed-surface');
+    for (const label of ENTRY_LABELS) {
+      expect(entry(label)).toHaveClass('feed-nav-link');
+    }
+  });
+});
