@@ -132,7 +132,10 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
       <video
         ref={videoRef}
         src={video.play_url}
-        poster={video.cover_url}
+        // 后端在没有封面时给的是**空串**。直接绑空串的话浏览器会把 poster 解析成
+        // 当前页面地址(实测:posterProp = http://localhost:5173/),白打一次请求、
+        // 还可能把页面本身当图片解。|| undefined 让这个属性干脆不出现。
+        poster={video.cover_url || undefined}
         muted={muted}
         loop
         playsInline

@@ -12,3 +12,16 @@ body {
   margin: 0;
   padding: 0;
 }
+
+/* 盒模型:浏览器默认是 content-box —— width 只算内容,
+ * padding / border 再**加**上去。凡是"宽度 + 水平内边距"同时出现的地方都会因此变宽:
+ * 左侧浮层导航写的是 width: 200px、左右各 12px 内边距 ⇒ 实际占 225px,而浮层上的文字
+ * 只按 200 避让 ⇒ 首字被压在导航底下(浏览器实测:nav 右边界 225、文字起点 216)。
+ *
+ * 改成 border-box 是业界标准重置,让代码里的 width 就等于它占的宽度,
+ * 也让 antd 的组件尺寸符合它自己的预期(本项目此前没引入 antd 的 reset)。 */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
