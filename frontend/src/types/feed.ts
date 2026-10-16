@@ -34,3 +34,30 @@ export interface ListLatestResp {
   items: FeedItem[];
   next_cursor?: FeedCursor;
 }
+
+// 热门(点赞)流的游标,对应后端 LikeCursor。
+// 排序键是 likes_count,不是 created_at —— 形状和 FeedCursor 不通用,所以另立一个类型。
+export interface LikeCursor {
+  likes_count: number;
+  video_id: number;
+}
+
+// 热门(点赞)流响应,对应后端 ListLikeResp。next_cursor 为空即到底。
+export interface ListLikeResp {
+  items: FeedItem[];
+  next_cursor?: LikeCursor;
+}
+
+// 关注流响应,对应后端 ListFollowingResp。
+// 游标形状与最新流完全相同,复用 FeedCursor —— 但注意它的 created_at 字段承载的
+// 是发布时刻 published_at(收件箱 ZSET 的 score),不是上传时刻。
+//
+// ⚠️ 判断「是否到底」只能看 next_cursor 为空,**绝不能看 items.length**:
+// items 比 limit 短(甚至是空数组)都是合法情况 —— 本页候选被截断、窗口内条目已失效
+// (视频下架/作者取关)时,游标之后确实还有内容。只看长度会提前停止并漏掉后面的内容。
+// 注意别用 `=== null` 判空:后端 Go 侧是 `*FeedCursor` + `omitempty`,nil 时整个
+// 键不发出来,前端拿到的是 undefined。统一用 `!next_cursor` 最稳。
+export interface ListFollowingResp {
+  items: FeedItem[];
+  next_cursor?: FeedCursor;
+}
