@@ -29,6 +29,18 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [muted, setMuted] = useState(true);
 
+  // 切声音。两条入口:点画面(鼠标习惯)和右上角那个真 <button>(键盘 / 读屏)——
+  // 整屏 div 挂 onClick 对键盘用户不可达,所以语义化控件那条不能省。
+  const toggleMute = () => {
+    const el = videoRef.current;
+    setMuted((m) => !m);
+    // 这次点击是真实的用户手势:若这一屏正卡在自动播放策略上(NotAllowedError),
+    // 借这个手势把它捞回来,用户就不会只看到一张永远不动的封面。
+    if (el?.paused) {
+      el.play()?.catch(() => {});
+    }
+  };
+
   // 播放权的唯一开关:在视口里就播,不在就停。
   // 放在 effect 里而不是渲染期直接调,是因为 <video> 是命令式的:渲染只声明它长什么样,
   // play / pause 是副作用。依赖只有 inView,滚动时不会每次重渲染都重新调 play。
@@ -38,10 +50,19 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
 
     if (inView) {
       // muted 默认 true,所以这里不用管"带声音自动播放会被拦"。
-      // play() 返回 Promise:用户还没交互过、或元素已被摘掉时会 reject(NotAllowedError /
-      // AbortError)。不接住就是一条 unhandled rejection —— 播不动是浏览器的事,
-      // 不该把整个首页拖垮。用可选链是因为测试环境(jsdom)没实现媒体播放,根本不返回 Promise。
-      el.play()?.catch(() => {});
+      // 用可选链是因为测试环境(jsdom)没实现媒体播放,根本不返回 Promise。
+      const played = el.play();
+      // 失败必须分两类,不能一律吞:
+      //   NotAllowedError —— 自动播放策略拦下(用户还没交互),预期内,静默;
+      //   AbortError       —— 切源 / 暂停把这次 play 打断了,也预期内;
+      //   其余(NotSupportedError / 解码失败 / 源 404)说明这一屏根本播不了 ——
+      //   那时用户看到的是一张永远不动的封面,不报出来就永远查不到。
+      played?.catch((err: unknown) => {
+        const name = err instanceof DOMException ? err.name : '';
+        if (name !== 'NotAllowedError' && name !== 'AbortError') {
+          console.error('[VideoPanel] play 失败', err);
+        }
+      });
     } else {
       // 挂载时也不可见 → 这里会顺手 pause 一次:没有 autoPlay 属性时它是空操作,
       // 但万一将来有人加上 autoplay、或浏览器自行恢复播放,这行才是"只有一屏出声"的保证。
@@ -53,13 +74,18 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
     <div
       ref={panelRef}
       data-testid="video-panel"
-      // doc 里"点一下切声音":点画面任意处都算,所以监听挂在容器上(见下,右侧槽位会拦住自己的点击)
-      onClick={() => setMuted((m) => !m)}
+      // doc 里"点一下切声音":点画面任意处都算(鼠标习惯)。键盘 / 读屏走右上角那个真按钮。
+      onClick={toggleMute}
       style={{
         position: 'relative',
         // 自己撑满一屏,不依赖父容器高度:父容器若是 auto 高,height:100% 会算成 0,
         // 视频整块塌掉。滚动的吸附(scroll-snap)由外层的列表容器管,不归这里。
+        //
+        // 100vh 是"大视口"高 —— 移动端浏览器带地址栏时,它比真正看得见的高度大,
+        // 底部那排(作者名 / 操作栏)会被压到地址栏下面。100dvh 是动态视口高,跟着地址栏伸缩;
+        // 不支持 dvh 的老浏览器忽略 maxHeight,自然退回 100vh。
         height: '100vh',
+        maxHeight: '100dvh',
         width: '100%',
         overflow: 'hidden',
         // 首帧解出来之前 / 加载失败时的底色,别让画面露白
@@ -86,6 +112,34 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
         }}
       />
 
+      {/* 声音开关:键盘与读屏用户唯一的可达入口(整屏 onClick 对他们不可达),
+          所以是个真 <button>,不是一个可点的 div。 */}
+      <button
+        type="button"
+        aria-label="视频声音"
+        aria-pressed={!muted}
+        onClick={(e) => {
+          e.stopPropagation();
+          toggleMute();
+        }}
+        style={{
+          position: 'absolute',
+          right: spacing.md,
+          top: spacing.md,
+          width: 40,
+          height: 40,
+          borderRadius: 999,
+          border: 'none',
+          cursor: 'pointer',
+          background: 'rgba(11, 11, 15, 0.6)',
+          color: TEXT_PRIMARY,
+          fontSize: 18,
+          lineHeight: 1,
+        }}
+      >
+        {muted ? '🔇' : '🔊'}
+      </button>
+
       {/* 底部整条渐变遮罩:从沉浸底 #0b0b0f 渐变到透明。
           文字和右侧操作栏都落在这条带上,所以它是"浮层可读"的地基 —— 画面亮起来时
           白字直接压上去是读不清的。 */}
@@ -96,7 +150,9 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           left: 0,
           right: 0,
           bottom: 0,
-          height: '38%',
+          // 百分比高度会随视口被压扁:矮视口(手机横屏 / 矮窗口)下文字会滑到渐变很淡的那段上,
+          // 白字压亮画面实测 ≈2.9:1,低于 3:1 底线。给一个像素下限,保证文字始终落在够暗的段上。
+          height: 'max(38%, 190px)',
           backgroundImage:
             'linear-gradient(to top, #0b0b0f 0%, rgba(11, 11, 15, 0.72) 45%, rgba(11, 11, 15, 0) 100%)',
           pointerEvents: 'none',

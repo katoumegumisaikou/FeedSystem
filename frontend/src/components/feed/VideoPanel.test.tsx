@@ -226,3 +226,52 @@ describe('VideoPanel 的画面上浮层', () => {
     expect(video.muted).toBe(true);
   });
 });
+
+describe('VideoPanel 的可达性 / 视口适配 / 失败可见性(复审补充)', () => {
+  it('声音开关是语义化按钮:键盘与读屏用户唯一可达的入口', () => {
+    const { video } = renderPanel();
+
+    // 整屏 div 上的 onClick 对键盘用户不可达 —— 必须有一个真控件
+    const toggle = screen.getByRole('button', { name: '视频声音' });
+    expect(toggle).toHaveAttribute('aria-pressed', 'true'); // 默认静音 → 声音是关的
+
+    fireEvent.click(toggle);
+
+    expect(video.muted).toBe(false);
+    expect(screen.getByRole('button', { name: '视频声音' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('被自动播放策略拦下时保持安静,真播放失败要现形', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { observer } = renderPanel();
+
+    // NotAllowedError:用户还没交互,浏览器拦下自动播放 —— 预期内,不该刷控制台
+    media.play.mockRejectedValueOnce(new DOMException('blocked', 'NotAllowedError'));
+    await act(async () => {
+      observer.emit(true);
+    });
+    expect(errorSpy).not.toHaveBeenCalled();
+
+    // NotSupportedError:这一屏根本播不了,用户只会看到一张不动的封面 —— 必须报出来
+    media.play.mockRejectedValueOnce(new DOMException('bad source', 'NotSupportedError'));
+    await act(async () => {
+      observer.emit(false);
+    });
+    await act(async () => {
+      observer.emit(true);
+    });
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
+
+  it('面板用动态视口高(dvh),遮罩高度带像素下限 —— 矮视口下文字仍落在暗段上', () => {
+    renderPanel();
+
+    // 100vh 是"大视口"高,移动端带地址栏时底部会被压到地址栏下;dvh 跟着地址栏伸缩
+    expect(screen.getByTestId('video-panel').style.maxHeight).toBe('100dvh');
+
+    // 纯百分比遮罩会在矮视口被压扁,文字滑到渐变很淡的一段上(实测 ≈2.9:1)
+    expect(screen.getByTestId('video-panel-scrim').style.height).toMatch(/px/);
+  });
+});
