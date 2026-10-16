@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { createElement } from 'react';
 import { listFollowees } from '../api/follow';
-import { resetFolloweesCacheForTest, setFollowee, useFollowees } from './useFollowees';
+import { invalidateFollowees, resetFolloweesCacheForTest, setFollowee, useFollowees } from './useFollowees';
 
 // 这一层要证明的是「整屏只拉一次全量、之后靠本地缓存维护」这条策略,而不是"hook 调了接口":
 //   ① followee_ids 收进 Set,判断已关注只看这个 Set;
@@ -145,5 +145,23 @@ describe('useFollowees 的全量缓存', () => {
     expect(screen.getByTestId('probe-7')).toHaveTextContent('未关注/就绪');
 
     expect(listFolloweesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('身份变了要作废:invalidateFollowees 之后重挂会重新拉一份', async () => {
+    listFolloweesMock.mockResolvedValue({ followee_ids: [7], limit: 5000 });
+
+    const first = renderProbes(7);
+    await waitFor(() => expect(screen.getByTestId('probe-7')).toHaveTextContent('已关注/就绪'));
+    expect(listFolloweesMock).toHaveBeenCalledTimes(1);
+
+    // 游客那次静默 401 也会把 loaded 置真。若不作废,登录进来之后缓存仍是空的且永不重取 ——
+    // 每个作者都会永远显示"关注"。登录 / 注册成功必须走这里。
+    act(() => invalidateFollowees());
+    first.unmount();
+
+    listFolloweesMock.mockResolvedValue({ followee_ids: [9], limit: 5000 });
+    renderProbes(9);
+    await waitFor(() => expect(screen.getByTestId('probe-9')).toHaveTextContent('已关注/就绪'));
+    expect(listFolloweesMock).toHaveBeenCalledTimes(2);
   });
 });

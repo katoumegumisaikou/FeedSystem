@@ -4,6 +4,7 @@ import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
 import SmsCodeButton from '../../components/SmsCodeButton';
 import { register } from '../../api/auth';
+import { invalidateFollowees } from '../../hooks/useFollowees';
 import type { RegisterReq } from '../../types/auth';
 
 // 字段校验与后端对齐:user_name 对齐 username.Validate,password 对齐 password.Strong
@@ -17,6 +18,8 @@ export default function RegisterPage() {
     setLoading(true);
     try {
       await register(values);
+      // 身份变了:同 pages/Login —— 游客阶段那份(空的)"我关注了谁"必须作废,否则登录后不会再拉。
+      invalidateFollowees();
       message.success('注册成功,已自动登录');
       router('/');
     } catch {

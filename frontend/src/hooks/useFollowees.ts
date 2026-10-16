@@ -11,6 +11,12 @@ import { listFollowees } from '../api/follow';
 // 为什么不用 React Context:这份状态不属于任何一棵子树 —— 它就是"当前登录用户"的一个
 // 只读视图(和 axios 实例一个性质),而挂 Provider 的位置本该在 Task 8/9 的容器里,
 // 本任务不动那些组合点。模块级缓存让任何位置的 FollowButton 直接能用,不必先被包一层。
+//
+// ⚠️ 这份缓存**与身份无关,而且拉过之后就不再拉**(loaded 是黏的)。所以**身份一变就必须作废**:
+//    游客那次静默 401 也会把 loaded 置真 → 不作废的话,用户登录进来后缓存仍是空的且永不重取,
+//    每个作者都会永远显示"关注";换账号登录则会沿用上一个人的列表。
+//    生产调用点:登录 / 注册成功(见 pages/Login、pages/Register)。**登出接上之后也必须调**
+//    —— 目前 api/auth.ts 的 logout() 还没有调用点。
 interface FolloweesState {
   ids: Set<number>;
   loading: boolean;
@@ -80,13 +86,21 @@ export function setFollowee(id: number, following: boolean): void {
   emit({ ...snapshot, ids, loaded: true });
 }
 
-// 仅测试用:把模块级缓存还原成"从没拉过"。
+// 让缓存作废:下一次有 FollowButton 挂载时会重新拉一份。
+//
+// 生产调用点是**身份变化**的地方 —— 登录 / 注册成功(见 pages/Login、pages/Register);
+// 登出接上之后也要调。理由见文件头那段 ⚠️。
+export function invalidateFollowees(): void {
+  inflight = null;
+  emit({ ids: new Set(), loading: false, loaded: false });
+}
+
+// 仅测试用:语义与 invalidateFollowees 相同,留一个自解释的名字给测试。
 // 这份缓存活在模块作用域里,单个测试文件里跨用例不会自动清掉 —— 不还原就会出现
 // "后一个用例因为已经拉过而根本不发请求、却拿到前一个用例的 ids"这种假绿灯。
 // 生产代码里没有任何调用点。
 export function resetFolloweesCacheForTest(): void {
-  inflight = null;
-  emit({ ids: new Set(), loading: false, loaded: false });
+  invalidateFollowees();
 }
 
 // 当前"我关注了谁"。

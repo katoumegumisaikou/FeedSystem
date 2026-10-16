@@ -3,6 +3,7 @@ import { App, Form, Input, Button, Divider } from 'antd';
 import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
 import { login, getMyProfile } from '../../api/auth';
+import { invalidateFollowees } from '../../hooks/useFollowees';
 import type { LoginReq } from '../../types/auth';
 
 // 登录成功后后端通过 SetTokenCookies 写入 access_token / refresh_token
@@ -16,7 +17,10 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await login(values);
-      const me = await getMyProfile(); 
+      const me = await getMyProfile();
+      // 身份变了:上一份「我关注了谁」不再属于当前用户。游客阶段那次静默 401 已经把缓存
+      // 标成"拉过了",不在这里作废的话,登录后每个作者都会永远显示"关注"。
+      invalidateFollowees();
       message.success('登录成功');
       router(`/users/${me.id}`); // 跳到当前登录用户自己的主页
     } catch {
