@@ -1,0 +1,14 @@
+/* 全局重置。
+ *
+ * 项目此前没有任何样式表:body 带着浏览器默认的 8px margin,于是"满屏出血"的沉浸页
+ * 从 (8, 8) 起 —— 四周露出白边,而且 height:100vh 在带 margin 的 body 里比视口高 16px,
+ * 多出一条页面滚动条(视频页自己不该有页面滚动,滚动归 FeedList 的容器)。
+ * 沉浸式页面要求"视口即画布",所以从根上清掉。
+ *
+ * 只清 margin / padding:字体、颜色、圆角一律交给 antd 的 ConfigProvider,
+ * 免得出现两套样式来源。 */
+html,
+body {
+  margin: 0;
+  padding: 0;
+}

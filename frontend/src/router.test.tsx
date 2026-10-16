@@ -6,7 +6,6 @@ import type { FeedListProps } from './components/feed/FeedList';
 import { getMyProfile, login } from './api/auth';
 import { listFollowingVideos, listHotVideos, listLatestVideos } from './api/feed';
 import { AppRouter } from './router';
-import { SIDEBAR_WIDTH } from './theme/tokens';
 import type { UserResp } from './types/auth';
 import type { FeedCursor, FeedItem } from './types/feed';
 
@@ -353,20 +352,20 @@ describe('页面给容器的 load 是稳定引用', () => {
   });
 });
 
-describe('页面自己让出左侧导航那一条', () => {
-  it('页面的左内缩就是 SIDEBAR_WIDTH:状态浮层按页面的盒子居中,不压在导航底下', async () => {
+describe('满屏出血:页面不缩视频,避让只落在浮层 / 文字上', () => {
+  it('页面盒子不带任何内缩:视频仍铺满可视区,导航浮在它上面', async () => {
     asGuest();
-    listLatestVideosMock.mockResolvedValue(EMPTY_PAGE);
+    listLatestVideosMock.mockResolvedValue({ items: [VIDEO], next_cursor: undefined });
 
     renderRouter('/');
 
-    const page = screen.getByTestId('feed-page');
-    expect(getComputedStyle(page).marginLeft).toBe(`${SIDEBAR_WIDTH}px`);
+    // 页面一旦整体内缩(margin / padding),**视频本身**就被挤窄 —— 那不再是"铺满可视区"
+    // (spec §7/§12 与"不能把视频本身缩窄"这条约束)。避让只能落在浮在视频上的东西上:
+    // VideoPanel 给左下角文字留的左内边距(见 VideoPanel.test.tsx 那条)。
+    expect(screen.getByTestId('feed-page').getAttribute('style')).toBeNull();
 
-    // 空态 / 加载中 / 失败重试都是 FeedList 的**居中浮层**(inset: 0 相对它自己的根),
-    // 所以盒子让开导航 = 浮层让开导航(手机宽度下居中的那行字正好压在导航上,重试按钮会点不到)。
-    expect(await screen.findByTestId('feed-list-status')).toBeInTheDocument();
-    expect(page).toContainElement(screen.getByTestId('feed-list-status'));
+    // 面板仍是整宽的一屏 —— 没有被页面推窄
+    expect((await screen.findByTestId('video-panel')).style.width).toBe('100%');
   });
 });
 

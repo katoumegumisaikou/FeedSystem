@@ -1,7 +1,5 @@
-import { type CSSProperties } from 'react';
 import { listLatestVideos } from '../../api/feed';
 import FeedList from '../../components/feed/FeedList';
-import { SIDEBAR_WIDTH } from '../../theme/tokens';
 import type { FeedCursor, FeedItem } from '../../types/feed';
 
 // spec §13 的空态文案,逐字搬过来。
@@ -20,20 +18,17 @@ async function loadLatestPage(
   return { items, nextCursor: next_cursor };
 }
 
-// 页面自己让出左侧导航那一条:外壳的导航是 fixed 浮层,不占布局宽度,这一条只能由页面给。
+// 页面**不**给导航留内缩:导航是 fixed 浮层(不占布局宽度),页面一内缩就等于把**视频本身**挤窄,
+// "铺满可视区"(spec §7/§12)当场不成立。避让只落在"浮在视频上的东西"上 —— 见 VideoPanel
+// 给左下角文字留的左内边距。
 //
-// 为什么必须让:FeedList 的四态浮层(加载中 / 加载失败+重试 / 空态)是按**自己的盒子**居中的
-// (inset: 0 相对它的根)。盒子从视口最左边开始的话,手机宽度下居中的那行字正好压在导航底下 ——
-// 那行字里还有"点此重试",点不到就是个死路。
-//
-// 为什么让 SIDEBAR_WIDTH 就够、也不亏:导航是不透明的固定浮层、盖住的就是这一条,
-// 让出去的这块本来也看不见(内容并没有真的少一块)。
-const pageStyle: CSSProperties = { marginLeft: SIDEBAR_WIDTH };
+// (待办,Task 11:FeedList 那个"按自己盒子居中"的四态浮层在窄屏会落到导航底下,
+//  该由**浮层自己**让开,而不是把整页缩窄。)
 
 /** 主页:最新视频流(GET /videos/latest)。游客可看 —— 后端这条是软鉴权。 */
 export default function HomePage() {
   return (
-    <div data-testid="feed-page" style={pageStyle}>
+    <div data-testid="feed-page">
       <FeedList<FeedCursor> load={loadLatestPage} emptyText={EMPTY_TEXT} />
     </div>
   );

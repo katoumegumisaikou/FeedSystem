@@ -1,7 +1,5 @@
-import { type CSSProperties } from 'react';
 import { listHotVideos } from '../../api/feed';
 import FeedList from '../../components/feed/FeedList';
-import { SIDEBAR_WIDTH } from '../../theme/tokens';
 import type { FeedItem, LikeCursor } from '../../types/feed';
 
 // spec §13 的空态文案:热门流没有自己那一句,用通用那句(不自己造文案)。
@@ -21,13 +19,10 @@ async function loadHotPage(
   return { items, nextCursor: next_cursor };
 }
 
-// 页面自己让出左侧导航那一条 —— 理由见 pages/Home(导航是 fixed 浮层,状态浮层按页面的盒子居中)。
-const pageStyle: CSSProperties = { marginLeft: SIDEBAR_WIDTH };
-
-/** 热门:按点赞数排序的流(GET /videos/like)。游客可看。 */
+/** 热门:按点赞数排序的流(GET /videos/like)。游客可看。页面不内缩,理由见 pages/Home。 */
 export default function HotPage() {
   return (
-    <div data-testid="feed-page" style={pageStyle}>
+    <div data-testid="feed-page">
       <FeedList<LikeCursor> load={loadHotPage} emptyText={EMPTY_TEXT} />
     </div>
   );

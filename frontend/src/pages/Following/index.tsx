@@ -1,7 +1,5 @@
-import { type CSSProperties } from 'react';
 import { listFollowingVideos } from '../../api/feed';
 import FeedList from '../../components/feed/FeedList';
-import { SIDEBAR_WIDTH } from '../../theme/tokens';
 import type { FeedCursor, FeedItem } from '../../types/feed';
 
 // spec §13 的空态文案,逐字搬过来 —— 关注流的"没有内容"和别的流不是一回事:
@@ -24,13 +22,10 @@ async function loadFollowingPage(
   return { items, nextCursor: next_cursor };
 }
 
-// 页面自己让出左侧导航那一条 —— 理由见 pages/Home(导航是 fixed 浮层,状态浮层按页面的盒子居中)。
-const pageStyle: CSSProperties = { marginLeft: SIDEBAR_WIDTH };
-
-/** 关注流:只看我关注的人(GET /videos/following,**需登录** —— 无 token 后端直接 401)。 */
+/** 关注流:只看我关注的人(GET /videos/following,**需登录**)。页面不内缩,理由见 pages/Home。 */
 export default function FollowingPage() {
   return (
-    <div data-testid="feed-page" style={pageStyle}>
+    <div data-testid="feed-page">
       <FeedList<FeedCursor> load={loadFollowingPage} emptyText={EMPTY_TEXT} />
     </div>
   );
