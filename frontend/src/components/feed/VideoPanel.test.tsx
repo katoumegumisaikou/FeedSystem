@@ -233,12 +233,13 @@ describe('VideoPanel 的可达性 / 视口适配 / 失败可见性(复审补充)
 
     // 整屏 div 上的 onClick 对键盘用户不可达 —— 必须有一个真控件
     const toggle = screen.getByRole('button', { name: '视频声音' });
-    expect(toggle).toHaveAttribute('aria-pressed', 'true'); // 默认静音 → 声音是关的
+    // aria-pressed 表达"这个开关现在是不是开着的" → 默认静音 = 声音没开 = false
+    expect(toggle).toHaveAttribute('aria-pressed', 'false');
 
     fireEvent.click(toggle);
 
     expect(video.muted).toBe(false);
-    expect(screen.getByRole('button', { name: '视频声音' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: '视频声音' })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('被自动播放策略拦下时保持安静,真播放失败要现形', async () => {
