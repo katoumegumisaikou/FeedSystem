@@ -209,6 +209,14 @@ describe('VideoPanel 的画面上浮层', () => {
     expect(screen.getByText('视频的描述文案')).toHaveStyle({ color: '#a1a1aa' });
   });
 
+  it('左下角的文字避让左侧浮层导航:左内边距按侧栏宽度留出', () => {
+    renderPanel();
+
+    // 侧栏是浮在视频上的(满屏出血,spec §7/§12),不避让的话作者名会被压在导航底下。
+    // 200(侧栏) + 16(spacing.md) = 216 —— 与右侧避让操作栏的 88px 对称。
+    expect(screen.getByTestId('video-panel-info').style.paddingLeft).toBe('216px');
+  });
+
   it('children 渲染在右侧浮层槽位(给 Task 8 的 ActionRail 留的位置)', () => {
     const { container } = renderPanel(<button type="button">点赞</button>);
 

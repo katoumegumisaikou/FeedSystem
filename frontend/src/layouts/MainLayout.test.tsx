@@ -133,3 +133,17 @@ describe('MainLayout 的深色只作用于自己这棵子树', () => {
     expect(getComputedStyle(screen.getByRole('navigation')).backgroundColor).toBe('rgb(22, 22, 28)');
   });
 });
+
+describe('MainLayout 的侧栏浮在内容之上(满屏出血)', () => {
+  // spec §7 / §12:这是用户**明确选的**几何 —— 视频铺满可视区,左侧导航浮在视频上。
+  // 侧栏一旦占布局宽度(在流里的一列),视频就被挤窄,"铺满"当场不成立;
+  // 文字避让改由 VideoPanel 自己的左内边距负责(与它右侧避让操作栏的做法对称)。
+  it('侧栏是浮层(fixed),不占内容区的宽度', () => {
+    getMyProfileMock.mockRejectedValue(new Error('401'));
+
+    renderLayout();
+
+    const nav = screen.getByRole('navigation');
+    expect(getComputedStyle(nav).position).toBe('fixed');
+  });
+});

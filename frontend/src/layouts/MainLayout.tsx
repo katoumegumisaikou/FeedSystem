@@ -2,11 +2,8 @@ import { useEffect, useState, type CSSProperties } from 'react';
 import { ConfigProvider, theme } from 'antd';
 import { NavLink, Outlet } from 'react-router-dom';
 import { getMyProfile } from '../api/auth';
-import { darkTokens, spacing } from '../theme/tokens';
+import { SIDEBAR_WIDTH, darkTokens, spacing } from '../theme/tokens';
 import type { UserResp } from '../types/auth';
-
-/** 左侧栏宽度:四个两字入口 + 12px 内边距放得下,再窄就有换行风险。 */
-const SIDEBAR_WIDTH = 200;
 
 /** 入口高度:与 FeedList 的"点此重试"(44)、ActionRail 的槽位(48)同一个理由 ——
  *  文字才 15px,不留够可点面积,手指点不中。 */
@@ -80,7 +77,7 @@ function Shell() {
     padding: `0 ${spacing.sm}px`,
     borderRadius: token.borderRadius,
     color: isActive ? token.colorText : token.colorTextSecondary,
-    fontSize: 15,
+    fontSize: 16,
     fontWeight: isActive ? 600 : 400,
     textDecoration: 'none',
     background: isActive ? token.colorBgElevated : 'transparent',
@@ -123,20 +120,26 @@ function Shell() {
   );
 }
 
-// 外壳:横向两栏(侧栏 + 内容区),自己撑满一屏。
+// 外壳:内容区自己撑满一屏,左侧导航**浮在它上面**(spec §7 / §12 的"满屏出血")。
+// 高度写成 100vh + maxHeight:100dvh 这一对,理由与 VideoPanel / FeedList 相同 ——
+// 移动端带地址栏时 100vh 比真正看得见的高度大,只有 dvh 跟着地址栏伸缩。
 const rootStyle: CSSProperties = {
-  display: 'flex',
-  minHeight: '100vh',
+  position: 'relative',
+  height: '100vh',
+  maxHeight: '100dvh',
   width: '100%',
+  overflow: 'hidden',
 };
 
-// 侧栏是**在流里的**一列,不是浮在视频上的浮层(spec §7 说的"浮"落在右边那条操作栏上):
-// VideoPanel 的作者名 / 标题是左下角贴着左边 16px 的,一条 200px 宽、满高的浮层盖上去,
-// 正好把那几行字压住 —— 那是"外壳把内容挡了",不是设计。所以侧栏占布局空间,
-// 内容区让出这一列,视频仍铺满剩下的整个可视区。
+// 侧栏是**浮层**(fixed),不占内容区的宽度 —— 视频要铺满整个可视区,导航盖在上面。
+// 代价是左下角那几行字会被压住,所以 VideoPanel 的左内边距按 SIDEBAR_WIDTH 避让
+// (与它右侧避让操作栏的做法对称);两处宽度共用同一个常量,不能各写一份。
 const sidebarStyle: CSSProperties = {
-  // 内容区变窄时不许挤走侧栏(宽度是设计值,不是可伸缩的)
-  flex: '0 0 auto',
+  position: 'fixed',
+  top: 0,
+  bottom: 0,
+  left: 0,
+  zIndex: 10,
   width: SIDEBAR_WIDTH,
   display: 'flex',
   flexDirection: 'column',
@@ -145,10 +148,10 @@ const sidebarStyle: CSSProperties = {
   padding: `${spacing.md}px ${spacing.sm}px`,
 };
 
-// 内容区:吃掉剩下的宽度(满屏出血的视频就落在这里)。
+// 内容区:整宽(满屏出血的视频就落在这里)。
 const contentStyle: CSSProperties = {
-  flex: 1,
-  // 不写 minWidth:0 的话,flex 子项的宽度下限是内容宽度 ——
-  // 内容区里的东西一旦比可用宽度宽,就会把侧栏顶出视口。
+  height: '100%',
+  // 不写 minWidth:0 的话,子项的宽度下限是内容宽度 ——
+  // 里面的东西一旦比可用宽度宽,就会撑出横向滚动条。
   minWidth: 0,
 };

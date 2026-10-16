@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Typography } from 'antd';
 import { useInView } from '../../hooks/useInView';
-import { spacing } from '../../theme/tokens';
+import { SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 
 // 深色 token 里的文字色,与 theme/tokens.ts 的 colorText / colorTextSecondary 同一个值。
@@ -166,9 +166,13 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           position: 'absolute',
           left: 0,
           bottom: 0,
-          // 右侧留出操作栏的宽度(36 * 2 + 16 = 88,按 spacing 刻度算),
-          // 文字不会伸到点赞按钮底下
-          padding: `${spacing.md}px ${spacing.xl * 2 + spacing.md}px ${spacing.xl}px ${spacing.md}px`,
+          // 两侧都要避让浮层:右边是操作栏(36 * 2 + 16 = 88,按 spacing 刻度算),
+          // 左边是 MainLayout 那条 fixed 导航(SIDEBAR_WIDTH)—— 满屏出血下它盖在视频上,
+          // 不避让就把作者名压住了。写成 longhand 是为了这两处各有出处、不会互相带跑。
+          paddingTop: spacing.md,
+          paddingRight: spacing.xl * 2 + spacing.md,
+          paddingBottom: spacing.xl,
+          paddingLeft: SIDEBAR_WIDTH + spacing.md,
           display: 'flex',
           flexDirection: 'column',
           gap: spacing.xxs,

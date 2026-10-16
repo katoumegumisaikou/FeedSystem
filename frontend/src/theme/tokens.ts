@@ -38,6 +38,10 @@ export const spacing = {
   xl: 36,
 } as const;
 
+/** 左侧浮层导航的宽度。VideoPanel 用同一个常量给左下角文字留避让 ——
+ *  两处必须同源:各写一份的话,作者名要么被压在导航底下,要么空出一大块。 */
+export const SIDEBAR_WIDTH = 200;
+
 export const darkTokens: ThemeConfig = {
   token: {
     // 背景(沉浸底)与表面(侧栏 / 面板)—— spec §13 的两个底色。
