@@ -55,8 +55,13 @@ export interface ListLikeResp {
 // ⚠️ 判断「是否到底」只能看 next_cursor 为空,**绝不能看 items.length**:
 // items 比 limit 短(甚至是空数组)都是合法情况 —— 本页候选被截断、窗口内条目已失效
 // (视频下架/作者取关)时,游标之后确实还有内容。只看长度会提前停止并漏掉后面的内容。
-// 注意别用 `=== null` 判空:后端 Go 侧是 `*FeedCursor` + `omitempty`,nil 时整个
-// 键不发出来,前端拿到的是 undefined。统一用 `!next_cursor` 最稳。
+//
+// 判空用 `next_cursor == null`(容器里的 isExhausted 就是这么写的),不要用 `!next_cursor`:
+//   · 后端 Go 侧是 `*FeedCursor` + `omitempty`,nil 时整个键**不发出来** ⇒ 前端拿到 undefined,
+//     `== null` 接得住;
+//   · 万一哪天后端把它写成显式的 null,`== null` 也接得住(而 `load(null)` 会被无限跟随);
+//   · `!next_cursor` 会连 `0` / `''` 这类**合法的假值**一起判成到底 —— 游标是泛型(见 FeedList),
+//     这个坑现在踩不到,但一旦有人给游标换个形状就会踩到。
 export interface ListFollowingResp {
   items: FeedItem[];
   next_cursor?: FeedCursor;

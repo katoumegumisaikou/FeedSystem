@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { likeVideo, unlikeVideo } from '../../api/video';
+import { palette } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 import type { LikeResp } from '../../types/video';
 import ActionRail from './ActionRail';
@@ -271,7 +272,9 @@ describe('ActionRail 的槽位与可读性', () => {
     renderRail();
 
     const count = screen.getByText('3');
-    expect(count).toHaveStyle({ color: '#f5f5f7' });
+    // 颜色断言取 palette(浮层的唯一颜色来源,见 theme/tokens.ts),而不是把 hex 再抄一遍:
+    // 这样"组件用的就是 token 那一份"才是被证明的,而不只是"两边恰好都写着 #f5f5f7"。
+    expect(count).toHaveStyle({ color: palette.textPrimary });
     expect(count.style.textShadow).not.toBe('');
   });
 

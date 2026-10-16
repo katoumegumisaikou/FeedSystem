@@ -1,18 +1,19 @@
 import { useEffect, useState, type CSSProperties } from 'react';
 import { Link } from 'react-router-dom';
 import { likeVideo, unlikeVideo } from '../../api/video';
-import { spacing } from '../../theme/tokens';
+import { palette, spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 import FollowButton from './FollowButton';
 import { CommentIcon, HeartIcon, UserIcon } from './icons';
 
-// 与 VideoPanel 同一份"浮在视频上的文字色"。不新造颜色:浮层里的颜色各处自己写一遍,
-// 深浅就不一致了(而且这些字压在画面遮罩上,自造一个更亮的白只会让对比度失控)。
-const TEXT_PRIMARY = '#f5f5f7';
-const TEXT_SECONDARY = '#a1a1aa';
+// 与 VideoPanel 同一份"浮在视频上的文字色" —— 取自 theme/tokens.ts 的 palette(唯一定义)。
+// 不新造颜色:浮层里的颜色各处自己写一遍,深浅就不一致了(而且这些字压在画面遮罩上,
+// 自造一个更亮的白只会让对比度失控)。
+const TEXT_PRIMARY = palette.textPrimary;
+const TEXT_SECONDARY = palette.textSecondary;
 
 // 计数是浮在视频上的数字:遮罩只保证"底部那一段够暗",画面亮起来时纯白字仍然会糊。
-// 再压一层与遮罩同源(#0b0b0f)的文字阴影 —— 等于把可读性从"画面恰好够暗"这个赌注上拿回来。
+// 再压一层与遮罩同源(palette.background)的文字阴影 —— 等于把可读性从"画面恰好够暗"这个赌注上拿回来。
 const COUNT_TEXT_SHADOW = '0 1px 2px rgba(11, 11, 15, 0.9)';
 
 const ICON_SIZE = 28;
@@ -106,7 +107,7 @@ export default function ActionRail({ video }: ActionRailProps) {
           borderRadius: '50%',
           overflow: 'hidden',
           border: `2px solid ${TEXT_PRIMARY}`,
-          background: '#2c2c36',
+          background: palette.border,
         }}
       >
         {video.avatar_url ? (

@@ -1,13 +1,16 @@
 import { useState, type CSSProperties } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { isUnauthorized } from '../../api/axios';
 import { followUser, unfollowUser } from '../../api/follow';
 import { setFollowee, useFollowees } from '../../hooks/useFollowees';
-import { spacing } from '../../theme/tokens';
+import { palette, spacing } from '../../theme/tokens';
 
-// 与 ActionRail / VideoPanel 同一份"浮在视频上的颜色"(见 ActionRail.tsx 顶部):
-// 浮层里的颜色各处各写一遍,深浅就不一致了。这里只用已经存在的三个值,不新造第四个。
-const TEXT_PRIMARY = '#f5f5f7';
-const TEXT_SECONDARY = '#a1a1aa';
-const SURFACE = '#2c2c36';
+// 与 ActionRail / VideoPanel 同一份"浮在视频上的颜色"(见 ActionRail.tsx 顶部),
+// 值取自 theme/tokens.ts 的 palette(唯一定义):浮层里的颜色各处各写一遍,深浅就不一致了。
+// 这里只用已经存在的三个值,不新造第四个。
+const TEXT_PRIMARY = palette.textPrimary;
+const TEXT_SECONDARY = palette.textSecondary;
+const SURFACE = palette.border;
 
 // 宽度按三个字("已关注")给足:两个状态字数不同(2 字 / 3 字),宽度跟着文字走的话,
 // 点一下按钮就左右弹一下,看着像页面抖了。48 是 ActionRail 的 SLOT_MIN_SIZE(触摸目标),
@@ -50,6 +53,8 @@ export default function FollowButton({ authorId }: FollowButtonProps) {
   const following = ids.has(authorId);
   // 请求在飞时挡住第二次点击:方向相反的两次响应谁后回来谁覆盖状态,界面就会随机错。
   const [pending, setPending] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
 
   const handleClick = async () => {
     if (pending || loading) return;
@@ -59,8 +64,23 @@ export default function FollowButton({ authorId }: FollowButtonProps) {
       // 不乐观更新、也不自己取反:直接采用响应里的 following。关注数有上限,
       // 服务端可能拒绝(那时回的是 false)—— 自己取反就会把"没关注上"显示成"已关注"。
       setFollowee(authorId, resp.following);
-    } catch {
-      // 失败保持原样。错误提示由 api/axios.ts 的拦截器统一弹,这里再弹一次就是两条 toast。
+    } catch (err) {
+      // 未登录 ⇒ 去登录页(spec §8:游客点「关注 / 个人主页」→ 去登录页;"个人主页"那一半
+      // 已经由 MainLayout 的入口做到了,原先缺的是这一半)。
+      //
+      // 为什么非跳不可(原来只靠拦截器弹一句"未登录"就结束了 —— 那段注释引的是 §11,
+      // 而 §11 说的恰恰是"游客访问 /following 要重定向到 /login"):一句转瞬即逝的 toast 不是出路。
+      // 用户停在同一个视频上,按钮还写着"关注",再点几次都一样 —— 关注这个动作对游客**没有**任何
+      // 可达的下一步。而且拦截器那句提示会被 silent 之类的口径影响,不该拿它当导航。
+      //
+      // 用的是 RequireLogin 那套机制(router state 放原址,登录成功回原页,见 pages/Login 的
+      // landingPath):与守卫同一条路径,不新造 `?next=` 这种第二套写法。
+      //
+      // 其余失败(5xx / 网络错误 / 超时)保持原样:错误提示由 api/axios.ts 的拦截器统一弹,
+      // 这里再弹一次就是两条 toast;也不该因为"后端挂了"把人送进登录页。
+      if (isUnauthorized(err)) {
+        navigate('/login', { state: { from: location.pathname } });
+      }
     } finally {
       setPending(false);
     }
@@ -86,7 +106,7 @@ export default function FollowButton({ authorId }: FollowButtonProps) {
         // 已关注:退回深底次色文字,弱化下去,不再抢注意力。
         background: following ? SURFACE : TEXT_PRIMARY,
         color: following ? TEXT_SECONDARY : SURFACE,
-        // 浅底压在亮画面上会和画面糊在一起,补一层与遮罩同源(#0b0b0f)的暗影 ——
+        // 浅底压在亮画面上会和画面糊在一起,补一层与遮罩同源(palette.background)的暗影 ——
         // 不新造颜色,和 ActionRail 计数用的文字阴影是同一个来源。
         boxShadow: following ? 'none' : '0 1px 3px rgba(11, 11, 15, 0.45)',
         opacity: disabled ? 0.6 : 1,

@@ -1,6 +1,5 @@
 import { request } from './axios';
 import type { PublicUserResp } from '../types/user';
-import type { UserResp } from '../types/auth';
 
 // 查他人公开资料,路径对齐 backend/internal/model/account/router.go 的 GET /users/:id。
 //
@@ -14,6 +13,6 @@ export function getUserProfile(id: number): Promise<PublicUserResp> {
   return request<PublicUserResp>({ url: `/users/${id}`, method: 'get' });
 }
 
-export function getMyProfile():Promise<UserResp>{
-  return request<UserResp>({ url: `/users/me`, method: 'get' });
-}
+// 这里原来还有一个 getMyProfile():**没有人 import 它**,而且它调的是 /users/me 却**没有 silent**
+// 开关 —— 真正在用的那一份是 api/auth.ts 的 getMyProfile({ silent })(两处探测登录态都靠它静默失败)。
+// 两个同名函数里更弱的那一个留着只会被误用,所以删掉。

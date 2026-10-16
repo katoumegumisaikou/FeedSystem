@@ -50,13 +50,9 @@ export interface UserResp {
   last_login_at?: string;
 }
 
-// 后端 PublicUserResp(GET /users/:id)。不含 phone/email/last_login_at —— 这条路径后端不返回联系方式。
-export interface PublicUserResp {
-  id: number;
-  user_name: string;
-  avatar_url?: string;
-  created_at: string;
-}
+// 后端 PublicUserResp(GET /users/:id)不在这个文件里 —— 它是**别人的公开资料**,与"我自己的"
+// UserResp 是两个视图(见 types/user.ts 的说明)。这里原来重复声明过一份,没有人用,已删:
+// 同一个名字有两处定义,改一处忘一处就是那种说不清哪个是真的错。
 
 // 后端错误码常量(对应 errs.ServiceErr.Code)
 export const ErrCode = {

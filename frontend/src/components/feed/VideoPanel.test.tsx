@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
+import { palette } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 import VideoPanel from './VideoPanel';
 
@@ -198,15 +199,17 @@ describe('VideoPanel 的画面上浮层', () => {
     // 遮罩:底边起从沉浸底渐变到透明,铺满整个底部(右侧操作栏也在这条带上)
     const scrim = screen.getByTestId('video-panel-scrim');
     expect(scrim.style.backgroundImage).toContain('linear-gradient');
-    expect(scrim.style.backgroundImage).toContain('#0b0b0f');
+    expect(scrim.style.backgroundImage).toContain(palette.background);
     expect(scrim.style.left).toBe('0px');
     expect(scrim.style.right).toBe('0px');
     expect(scrim.style.bottom).toBe('0px');
 
-    // 文字:主文字 #f5f5f7、次文字 #a1a1aa —— 不新造颜色
-    expect(screen.getByText('@megu')).toHaveStyle({ color: '#f5f5f7' });
-    expect(screen.getByText('第一条视频')).toHaveStyle({ color: '#f5f5f7' });
-    expect(screen.getByText('视频的描述文案')).toHaveStyle({ color: '#a1a1aa' });
+    // 文字:主文字 / 次文字都必须取 palette 那一份(不是自己抄一遍 hex)——
+    // 断的是 **palette 里的那个值**,所以改 palette 会同时改到组件与这条断言(同源)。
+    // palette 本身等于 spec §13 那张表的值,由 theme/tokens.test.tsx 钉住。
+    expect(screen.getByText('@megu')).toHaveStyle({ color: palette.textPrimary });
+    expect(screen.getByText('第一条视频')).toHaveStyle({ color: palette.textPrimary });
+    expect(screen.getByText('视频的描述文案')).toHaveStyle({ color: palette.textSecondary });
   });
 
   it('左下角的文字避让左侧浮层导航:左内边距按侧栏宽度留出', () => {
@@ -282,5 +285,25 @@ describe('VideoPanel 的可达性 / 视口适配 / 失败可见性(复审补充)
 
     // 纯百分比遮罩会在矮视口被压扁,文字滑到渐变很淡的一段上(实测 ≈2.9:1)
     expect(screen.getByTestId('video-panel-scrim').style.height).toMatch(/px/);
+  });
+
+  it('点画面重试播放时,真失败也要现形 —— 不是一律吞掉', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { video } = renderPanel();
+
+    // jsdom 没有媒体实现,"这一屏现在没在播"这个事实只能自己钉住 ——
+    // toggleMute 只在 paused 时借这次点击重试 play()(它就是这条分支的唯一入口)。
+    Object.defineProperty(video, 'paused', { configurable: true, value: true });
+    media.play.mockRejectedValueOnce(new DOMException('bad source', 'NotSupportedError'));
+
+    fireEvent.click(screen.getByTestId('video-panel'));
+    await act(async () => {});
+
+    // 这次重试的失败分类必须与"视口驱动的那次播放"**同一套**:NotAllowedError / AbortError 静默,
+    // 其余现形。原来这里是个空 catch(() => {}) —— 与六行之下那条分类策略自相矛盾,
+    // 真播不了的时候控制台里什么都没有。
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 });

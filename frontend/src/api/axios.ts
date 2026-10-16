@@ -22,6 +22,48 @@ const http = axios.create({
   withCredentials: true,
 });
 
+// 「未登录」的业务码 = 后端 internal/pkg/errs/errs.go 的 ErrUnauthorized。
+// 为什么要认识它:后端的错误有**两种**落地形态(见下面 isUnauthorized 的注释),
+// 只认 HTTP 状态会漏掉一半。
+const CODE_UNAUTHORIZED = 10002;
+
+/** 业务错误的错误对象:把 body 里的 code 带在身上。
+ *
+ *  为什么非带不可:这类响应的 HTTP 状态是 200(见 backend/internal/pkg/response/response.go
+ *  的 Error —— 它一律 c.JSON(http.StatusOK, ...)),所以光看状态码分不出"未登录"和
+ *  "服务器内部错误",光看 msg 又是在猜文案。调用方要按码分类(isUnauthorized 认 10002),
+ *  分类的依据就必须由这里递出去。
+ *
+ *  仍然是 Error 的子类:原来 `catch (e) { e.message }` / `rejects.toThrow(msg)` 的调用方一处不用改。 */
+export class ApiError extends Error {
+  readonly code: number;
+
+  constructor(code: number, msg: string) {
+    super(msg);
+    this.name = 'ApiError';
+    this.code = code;
+  }
+}
+
+/** 这个失败是不是「未登录」?
+ *
+ *  两种形态都算:
+ *    ① HTTP 401 —— 中间件直接拒掉(auth.go 的 abortUnauthorized,SetSensitive 路由无 token /
+ *       token 失效都走它);
+ *    ② 业务码 10002 —— handler / service 层返回 errs.ErrUnauthorized,经 response.Error 落成
+ *       **HTTP 200 + body.code**(ApiError 那个 code)。
+ *  其余(5xx / 网络失败 / 10s 超时 / 400)一律**不是**:把它们当成游客,会把一个已登录的人
+ *  莫名送回登录页 —— 他看到的是一次无法解释的跳转,而且理由根本不存在。
+ *
+ *  判定收在这一处:守卫(router.tsx)、关注按钮(FollowButton.tsx)用的是同一个事实,
+ *  各写各的就迟早会分叉。
+ */
+export function isUnauthorized(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { response?: { status?: number }; code?: unknown };
+  return e.response?.status === 401 || e.code === CODE_UNAUTHORIZED;
+}
+
 // 拦截器解包后端统一格式 {code, msg, data}:成功返回 data,失败弹错并 reject
 http.interceptors.response.use(
   (resp: AxiosResponse<ApiResp>) => {
@@ -32,7 +74,8 @@ http.interceptors.response.use(
         return body.data as unknown as AxiosResponse;
       }
       if (!silent) globalMessage?.error(body.msg || '请求失败');
-      return Promise.reject(new Error(body.msg || `code=${body.code}`));
+      // 带上 code:调用方要按码分类(见 isUnauthorized),不能只给一句文案。
+      return Promise.reject(new ApiError(body.code, body.msg || `code=${body.code}`));
     }
     // 兼容没有 code 的响应
     return resp;

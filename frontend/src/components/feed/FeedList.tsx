@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useInView } from '../../hooks/useInView';
-import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
+import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, palette, spacing } from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 import ActionRail from './ActionRail';
 import VideoPanel from './VideoPanel';
@@ -20,13 +20,23 @@ const MORE_TEXT = '加载更多';
 // 设备像素比 1.25 / 1.5 的屏幕上都会带来 ±1px 的误差;留 2px 才不会把"到底"判丢。
 const TAIL_SLACK_PX = 2;
 
-// 与 VideoPanel / ActionRail / FollowButton 同一份深色浮层配色(见 ActionRail.tsx 顶部):
-// 浮层里的颜色各处各写一遍,深浅就不一致了 —— 这里只用已经存在的四个值,不新造第五个。
-const TEXT_PRIMARY = '#f5f5f7';
-const TEXT_SECONDARY = '#a1a1aa';
-const SURFACE = '#16161c';
-const BORDER = '#2c2c36';
-const IMMERSIVE_BG = '#0b0b0f';
+// 与 VideoPanel / ActionRail / FollowButton 同一份深色浮层配色(见 ActionRail.tsx 顶部),
+// 值取自 theme/tokens.ts 的 palette(唯一定义):浮层里的颜色各处各写一遍,深浅就不一致了 ——
+// 这里只用已经存在的四个值,不新造第五个。
+const TEXT_PRIMARY = palette.textPrimary;
+const TEXT_SECONDARY = palette.textSecondary;
+const SURFACE = palette.surface;
+const BORDER = palette.border;
+const IMMERSIVE_BG = palette.background;
+
+// 底部那条提示条的下边距(px):它自己的高度约 54px(重试按钮 44 + 上下各 4 的内边距 + 2 的描边),
+// 而 VideoPanel 左下角的信息块是从底边 0 起画的(它的 paddingBottom 是 spacing.xl = 36)。
+// 于是贴到 bottom: spacing.xxs(4) 时,提示条占据的竖向区间是 4..58 —— 正好盖在那块文字上。
+// 抬到 56:整条提示落在信息块上方,谁也不压谁(原来那条注释只算了信息块的 padding,
+// 没算提示条自己的高度,所以"压到 4px 就不会盖住"是不成立的)。
+// 算式写出来,免得下一个人再手算一遍:
+//   44(重试触摸目标)+ 4×2(提示条自身上下内边距)+ 2(上下描边)+ 2(留一条缝)= 56
+const TAIL_STATUS_BOTTOM = 56;
 
 // 「到底」的唯一判据:**游标缺失**。
 //
@@ -40,6 +50,8 @@ const IMMERSIVE_BG = '#0b0b0f';
 //   · null 是保险:万一哪天后端把它写成显式的 null,`load(null)` 会被无限跟随
 //     (每页都回同一个 null),那就是死循环;
 //   · 不用 `!cursor`:游标是泛型,可能是 `0` / `''` 这类合法的假值,`!` 会误判成到底。
+//     (types/feed.ts 那条注释原来写的是"统一用 `!next_cursor` 最稳" —— 与本实现的理由正好相反,
+//     已改成与本文件一致的 `== null`。)
 function isExhausted<C>(cursor: C | undefined): boolean {
   return cursor == null;
 }
@@ -81,6 +93,8 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
 
   // 「用户到过列表尾部了吗」—— 只用来决定"没有更多了"那行字什么时候摆出来(见下)。
   // 一旦为真就不再回退:浮层是钉在视口上的,出现又消失地闪一下比晚一点出现难受得多。
+  // 唯一的例外是"用户往回滚"(见下面信号 ② 的实现)—— 那不是闪,是它该走:
+  // 用户已经回到前面那几屏上,这行字还挂着就是在压他正在看的内容。
   const [reachedTail, setReachedTail] = useState(false);
   // 滚动容器:既是被观察的滚动位置,也是"贴到底"那个判定的读点。
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -147,12 +161,15 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
   // **当前这一屏**上。而"到底"完全可能在你还看着前面的内容时就成立(一页 5 条、游标恰好用尽),
   // 于是这行字会一直压在一条你还没看完的视频上。它说的是"后面没有了",不该出现在你还没看的内容上。
   //
-  // 门有两条信号,OR 起来(任一条成立就算到过尾部):
+  // 门有两条信号,OR 起来(任一条成立就算到过尾部);两条里只有 ② 能收回,理由见那一条:
   //   ① 哨兵进过视口 —— 与"触底加载"同一个信号。容器里"到达尾部"只有一个概念,不新造第二个。
+  //      它只置真:那是一次性的跳变,而"往回滚"必然经过信号 ② 的几何判定。
   //   ② 滚动位置已经贴到底 —— 为什么非有它不可:哨兵是**列表末尾之后**那 1px,而每一屏都正好
   //      一屏高、吸附又是对齐到顶边的,滚到底时吸附会把位置拉回最后一屏的顶边,哨兵正好卡在
   //      滚动区下沿**之外**,只有手指还在拖、位置还没被拉回的那一瞬它才真的进视口。
   //      只靠 ①,这行字可能永远不出现(单条一页时更是连 1px 都拖不动)。
+  //      它是**双向**的:贴到底置真、离开底部置假 —— 否则用户滚回上面之后,这行字仍然钉在
+  //      视口中央压着他正在看的那一屏。
   // ① 只认"从不可见变成可见"那**一次跳变**,而且要求此刻**已经有内容**:
   //   - 有内容:首帧 items 为空时哨兵是滚动区里唯一的孩子,浏览器那次初始 IO 回调会立刻报可见;
   //     若此刻就把门打开,这道门等于不存在(首屏"空页 + 有游标"正是它要挡的情形)。
@@ -166,7 +183,7 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
     if (justBecameVisible && items.length > 0) setReachedTail(true);
   }, [sentinelInView, items.length]);
 
-  // ② 的实现:读滚动容器的三条几何值,贴到底(容差见 TAIL_SLACK_PX)就置真。
+  // ② 的实现:读滚动容器的三条几何值,贴底就置真、离开底部就置假(容差见 TAIL_SLACK_PX)。
   // 挂载时先判一次 —— 内容不足一屏时(单条一页)根本没有滚动,这一刻就已经在底部;
   // 每追加一页后重判一次(items.length 在依赖里);再挂 scroll(滚动中)与 resize
   // (旋转屏幕 / 拉窗口会改 clientHeight,可能"变到底了"却不产生任何 scroll 事件)。
@@ -177,8 +194,13 @@ export default function FeedList<C>({ load, emptyText }: FeedListProps<C>): JSX.
     // 挂载那一刻就会把这道门打开 —— 那这道门就等于不存在(首屏还没回来时尤其如此)。
     if (!el || items.length === 0) return;
 
+    // 读一次几何,写回"贴到底"这件事 —— **双向**:
+    //   贴到底 ⇒ 开门;离开底部 ⇒ 关门。
+    // 为什么必须能关:这行字是钉在视口上的浮层(见上面那段注释),只置真的话,用户滚回上面看第 1 条时
+    // 它仍然挂在画面中央,压着已经看过的内容。信号 ①(哨兵进过视口)那条跳变仍然只置真 ——
+    // 它本身是一次性的跳变,而"往回滚"必然伴随 scroll 事件,由这条几何判定负责收回。
     const nearBottom = () => {
-      if (el.scrollTop + el.clientHeight >= el.scrollHeight - TAIL_SLACK_PX) setReachedTail(true);
+      setReachedTail(el.scrollTop + el.clientHeight >= el.scrollHeight - TAIL_SLACK_PX);
     };
     nearBottom();
     el.addEventListener('scroll', nearBottom, { passive: true });
@@ -353,9 +375,9 @@ const fullScreenStatusStyle: CSSProperties = {
 // 已经有视频在屏上:提示退成底部居中的一小条 —— 不该盖住画面,也不该抢视线。
 const tailStatusStyle: CSSProperties = {
   position: 'absolute',
-  // 贴到 4px:VideoPanel 左下角的信息块是从底边 36px 起画的(它自己的 padding),
-  // 压到 4px 就不会盖在那几行字上;右侧操作栏在右半边,居中的小条也碰不到它。
-  bottom: spacing.xxs,
+  // 抬到 56px:见 TAIL_STATUS_BOTTOM 的算式 —— 这条自己就有 ~54px 高,贴到 4px 会盖住
+  // VideoPanel 左下角那三行字(它的 paddingBottom 只有 36px)。右侧操作栏在右半边,居中的小条碰不到它。
+  bottom: TAIL_STATUS_BOTTOM,
   // 同样让开左侧浮层导航:原来是 left:50% + translateX(-50%),那是按**整宽**居中 ——
   // 窄屏下这一条会从左半边起画,压在导航底下。改成"在导航右边那一条里居中"(left + right + auto 外边距)。
   left: SIDEBAR_WIDTH,

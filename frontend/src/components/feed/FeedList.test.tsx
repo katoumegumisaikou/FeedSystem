@@ -651,6 +651,33 @@ describe('到底那行字只在用户到过尾部之后才摆出来', () => {
     expect(screen.getByText(END_TEXT)).toBeInTheDocument();
   });
 
+  it('滚回顶部 ⇒ 收起这行字(它钉在视口上,不该继续压着已经看过的内容)', async () => {
+    const load = makeLoad([{ items: [makeItem(1), makeItem(2)], nextCursor: undefined }]);
+    renderList(load);
+    await flush();
+
+    await act(async () => {
+      scroller().scrollTop = SCREEN_PX;
+      fireEvent.scroll(scroller());
+    });
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
+
+    // 往回滚:浮层钉在视口上,用户回到第 1 条时这行字还挂在画面中央 —— 说的是"后面没有了",
+    // 却站在一条他正在看的内容上。所以"贴到底"这个信号必须是**双向**的(离开底部就收回)。
+    await act(async () => {
+      scroller().scrollTop = 0;
+      fireEvent.scroll(scroller());
+    });
+    expect(screen.queryByText(END_TEXT)).not.toBeInTheDocument();
+
+    // 再滑回去还得重新摆出来(收回的不是这道门本身,只是那一刻的状态)
+    await act(async () => {
+      scroller().scrollTop = SCREEN_PX;
+      fireEvent.scroll(scroller());
+    });
+    expect(screen.getByText(END_TEXT)).toBeInTheDocument();
+  });
+
   it('到底但一条都没有:空态文案不受这道门影响(屏幕上什么都没有,必须有话说)', async () => {
     const load = makeLoad([{ items: [], nextCursor: undefined }]);
     renderList(load);

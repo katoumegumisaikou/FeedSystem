@@ -64,10 +64,23 @@ const ME: UserResp = {
   created_at: '2026-09-12T16:50:53.025052Z',
 };
 
+// 四态文案(spec §13 那张表的原话),逐字写在下面:守卫自己那份一旦被改掉,这些用例就该红。
+const LOADING_TEXT = '加载中…';
+const ERROR_TEXT = '加载失败,点此重试';
+
 /** 探测 401 = 游客。**注意外壳(MainLayout)与守卫都会各探一次** ——
- *  断言不能写成"只调了一次",那是实现细节,不是行为。 */
+ *  断言不能写成"只调了一次",那是实现细节,不是行为。
+ *
+ *  为什么失败对象要写成这个样子:守卫现在**按失败种类分类**(只有 401 / 业务码 10002 才算游客)。
+ *  原来的 `new Error('401')` 是个"什么失败都行"的替身,在新行为下它恰好代表"探测失败"
+ *  (消息里写 401 没用 —— 判定看的是 HTTP 状态与业务码,不是错误消息文本)。 */
 function asGuest() {
-  getMyProfileMock.mockRejectedValue(new Error('401'));
+  getMyProfileMock.mockRejectedValue({ response: { status: 401 } });
+}
+
+/** 探测撞上 5xx / 网络故障 / 超时:这不是"没登录",守卫不许把人送去登录页。 */
+function asProbeFailed(err: unknown = { response: { status: 500 } }) {
+  getMyProfileMock.mockRejectedValue(err);
 }
 
 function asLoggedIn() {
@@ -224,7 +237,7 @@ describe('三个流的路由接入', () => {
     expect(feedRoot()).not.toBeInTheDocument();
   });
 
-  it('登录态还在探测时,/following 不放行、也不先闪一下登录页', async () => {
+  it('登录态还在探测时,/following 不放行、也不先闪一下登录页,但**有话说**', async () => {
     const probe = deferred<UserResp>();
     getMyProfileMock.mockReturnValue(probe.promise);
 
@@ -236,11 +249,47 @@ describe('三个流的路由接入', () => {
     expect(loginHeading()).not.toBeInTheDocument();
     expect(listFollowingVideosMock).not.toHaveBeenCalled();
 
+    // ...但也不许是一片黑:外壳是近黑底,"什么都不渲染"最多能黑到 axios 的 10s 超时。
+    // 这一帧必须有一句"在加载"(role=status ⇒ 读屏也会听到,不是只有眼睛看得到)。
+    expect(screen.getByRole('status')).toHaveTextContent(LOADING_TEXT);
+
     await act(async () => {
-      probe.reject(new Error('401'));
+      probe.reject({ response: { status: 401 } });
     });
 
     await waitFor(() => expect(loginHeading()).toBeInTheDocument());
+  });
+
+  it('探测撞上 500:不跳登录页,给一个可重试的失败态;点了重试能放行', async () => {
+    asProbeFailed();
+    listFollowingVideosMock.mockResolvedValue(EMPTY_PAGE);
+
+    renderRouter('/following');
+
+    // 5xx / 网络故障 / 超时都**不是**"没登录" —— 把一个已登录的人送去登录页,
+    // 他看到的是一个无法解释的跳转(而且登录页也会因为同一个原因失败)。
+    expect(await screen.findByRole('button', { name: ERROR_TEXT })).toBeInTheDocument();
+    expect(loginHeading()).not.toBeInTheDocument();
+    expect(listFollowingVideosMock).not.toHaveBeenCalled();
+
+    // 后端回来了:重试必须真的再探一次并放行(否则这个失败态就是个死胡同)
+    asLoggedIn();
+
+    await userEvent.click(screen.getByRole('button', { name: ERROR_TEXT }));
+
+    expect(await screen.findByText(FOLLOWING_EMPTY_TEXT)).toBeInTheDocument();
+    expect(listFollowingVideosMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('业务码 10002(HTTP 200 + code)也算未登录 ⇒ 送登录页', async () => {
+    // 后端 handler / service 层的错误走 response.Error:HTTP 200 + body.code。
+    // 只看 HTTP 状态会漏掉这一种,而它说的就是"未登录"(与中间件那条 401 同一件事)。
+    asProbeFailed({ code: 10002 });
+
+    renderRouter('/following');
+
+    await waitFor(() => expect(loginHeading()).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: ERROR_TEXT })).toBeNull();
   });
 
   it('已登录访问 /following:守卫放行,拉的是关注流', async () => {

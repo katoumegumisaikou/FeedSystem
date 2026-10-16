@@ -1,5 +1,6 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { followUser, listFollowees, unfollowUser } from '../../api/follow';
 import { resetFolloweesCacheForTest } from '../../hooks/useFollowees';
 import FollowButton from './FollowButton';
@@ -34,9 +35,38 @@ beforeEach(() => {
 
 const button = () => screen.getByTestId('follow-button');
 
+// 未登录时点「关注」要去登录页(spec §8),所以按钮现在会 useNavigate —— 它必须在 Router 上下文里。
+// 这里放两条路由:/login 挂一个探针(把跳过去没有、带没带原址画在 DOM 上),
+// 其余路径渲染按钮本身。跳转成功 = 探针出现;没跳 = 探针不存在(人还在按钮这一页)。
+const FUTURE_FLAGS = { v7_startTransition: true, v7_relativeSplatPath: true } as const;
+
+function LocationProbe() {
+  const location = useLocation();
+  const from = (location.state as { from?: string } | null | undefined)?.from;
+  return (
+    <>
+      <span data-testid="location">{location.pathname}</span>
+      <span data-testid="login-from">{from ?? ''}</span>
+    </>
+  );
+}
+
+// 初始路径是 /hot:这样"原址"不是按钮所在页的默认值(/),断言才有区分度 ——
+// 一个把 from 写死成 '/' 的实现会让下面的用例红。
+function renderButton(authorId: number, path = '/hot') {
+  return render(
+    <MemoryRouter initialEntries={[path]} future={FUTURE_FLAGS}>
+      <Routes>
+        <Route path="/login" element={<LocationProbe />} />
+        <Route path="*" element={<FollowButton authorId={authorId} />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 // 按钮在"全量列表还没回来"时是禁用的(见 FollowButton.tsx)。要点击就得先等它可用。
 async function renderLoaded(authorId: number) {
-  render(<FollowButton authorId={authorId} />);
+  renderButton(authorId);
   await waitFor(() => expect(button()).toBeEnabled());
 }
 
@@ -44,7 +74,7 @@ describe('FollowButton 的已关注态来自全量关注列表', () => {
   it('目标在 followee_ids 里 → 显示"已关注"', async () => {
     listFolloweesMock.mockResolvedValue({ followee_ids: [77], limit: 5000 });
 
-    render(<FollowButton authorId={77} />);
+    renderButton(77);
 
     await waitFor(() => expect(button()).toHaveTextContent('已关注'));
   });
@@ -52,7 +82,7 @@ describe('FollowButton 的已关注态来自全量关注列表', () => {
   it('目标不在 followee_ids 里 → 显示"关注"', async () => {
     listFolloweesMock.mockResolvedValue({ followee_ids: [77], limit: 5000 });
 
-    render(<FollowButton authorId={78} />);
+    renderButton(78);
 
     await waitFor(() => expect(button()).toBeEnabled());
     expect(button()).toHaveTextContent('关注');
@@ -62,11 +92,12 @@ describe('FollowButton 的已关注态来自全量关注列表', () => {
   it('同屏两个按钮共用一次全量请求(每个 rail 各拉一次会把接口打穿)', async () => {
     listFolloweesMock.mockResolvedValue({ followee_ids: [77], limit: 5000 });
 
+    // 两个按钮同屏:走 Router 才能让 useNavigate 有上下文(与 renderButton 同一套包装)
     render(
-      <>
+      <MemoryRouter initialEntries={['/hot']} future={FUTURE_FLAGS}>
         <FollowButton authorId={77} />
         <FollowButton authorId={78} />
-      </>,
+      </MemoryRouter>,
     );
 
     await waitFor(() => expect(screen.getAllByTestId('follow-button')[1]).toBeEnabled());
@@ -167,6 +198,47 @@ describe('FollowButton 的接口接线', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
+  // spec §8:游客点「关注 / 个人主页」→ 去登录页。
+  // 关注这一半原来只有拦截器那句转瞬即逝的"未登录":用户停在同一个视频上,按钮还是"关注",
+  // 点几次都一样 —— 那不是出路。现在按 401 跳到登录页,并把原址放进 router state,
+  // 登录成功后回到这里(与 router.tsx 的 RequireLogin 同一套机制、同一个 state 形状)。
+  it('401(未登录)时跳登录页,并把原址带上', async () => {
+    followUserMock.mockRejectedValue({ response: { status: 401 } });
+
+    await renderLoaded(77);
+
+    await userEvent.click(button());
+
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/login'));
+    // 原址必须是**当前这一页**(/hot),不是写死的 '/':登录后才回得到他刚才在看的那条流
+    expect(screen.getByTestId('login-from')).toHaveTextContent('/hot');
+  });
+
+  it('业务码 10002(未登录,HTTP 200 + code)同样跳登录页', async () => {
+    // 后端 handler / service 层的错误走 response.Error:HTTP 200 + body.code。
+    // 只看 HTTP 状态会把这一种漏掉,而它和 401 说的是同一件事。
+    followUserMock.mockRejectedValue({ code: 10002 });
+
+    await renderLoaded(77);
+    await userEvent.click(button());
+
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/login'));
+  });
+
+  it('非 401 的失败(5xx / 网络错误)不跳转:留在这一页,什么都不弹', async () => {
+    followUserMock.mockRejectedValue({ response: { status: 500 } });
+
+    await renderLoaded(77);
+
+    await userEvent.click(button());
+    await act(async () => {});
+
+    // 探针只在 /login 那条路由上 —— 它不出现,就说明人还在这条流上
+    expect(screen.queryByTestId('location')).toBeNull();
+    expect(button()).toHaveTextContent('关注');
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
   it('全量列表拉失败时按钮仍可用:按当前(空)缓存显示"关注",关注成功后本地纠正', async () => {
     listFolloweesMock.mockRejectedValue(new Error('boom'));
     followUserMock.mockResolvedValue({ following: true, follower_count: 1 });
@@ -184,7 +256,7 @@ describe('FollowButton 的可达性', () => {
   it('是一个真按钮:键盘 / 读屏可达,状态靠 aria-pressed 表达', async () => {
     listFolloweesMock.mockResolvedValue({ followee_ids: [77], limit: 5000 });
 
-    render(<FollowButton authorId={77} />);
+    renderButton(77);
     await waitFor(() => expect(button()).toHaveAttribute('aria-pressed', 'true'));
 
     expect(button()).toHaveRole('button');

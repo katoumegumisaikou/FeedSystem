@@ -1,6 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen } from '@testing-library/react';
 import { ConfigProvider, theme } from 'antd';
-import { darkTokens, spacing } from './tokens';
+import { darkTokens, palette, spacing } from './tokens';
 
 // 这些值来自 spec §13 的「深色 token 起始值」表 —— 它们决定了新 feed 页面长什么样,
 // 又只有这一处定义,所以用测试钉死:值被改动时必须有人为它负责。
@@ -40,6 +42,62 @@ describe('深色设计 token', () => {
 
   it('间距刻度按 spec §13 的 6 档导出(antd 没有 spacing token,只能自己给)', () => {
     expect(spacing).toEqual({ xxs: 4, xs: 8, sm: 12, md: 16, lg: 24, xl: 36 });
+  });
+});
+
+// palette 是**手写样式**那一半(浮在视频上的遮罩 / 文字 / 操作栏 / 关注按钮 / 底部提示条)的唯一
+// 颜色来源:它们不在 antd 的 token 体系里(ConfigProvider 管不到 inline 样式),原来五个文件各抄一遍
+// hex,改 token 时没人会想起它们 —— spec §7 的"同源"在手写样式上是断的。
+describe('palette:手写样式的颜色只有这一份', () => {
+  it('就是 spec §13「深色 token 起始值」里被用到的六个值', () => {
+    expect(palette).toEqual({
+      background: '#0b0b0f',
+      surface: '#16161c',
+      elevated: '#1c1c24',
+      border: '#2c2c36',
+      textPrimary: '#f5f5f7',
+      textSecondary: '#a1a1aa',
+    });
+  });
+
+  it('darkTokens 那几项取自 palette:antd 渲染的与手写的不会再分叉', () => {
+    expect(darkTokens.token?.colorBgBase).toBe(palette.background);
+    expect(darkTokens.token?.colorBgLayout).toBe(palette.background);
+    expect(darkTokens.token?.colorBgContainer).toBe(palette.surface);
+    expect(darkTokens.token?.colorBgElevated).toBe(palette.elevated);
+    expect(darkTokens.token?.colorBorder).toBe(palette.border);
+    expect(darkTokens.token?.colorText).toBe(palette.textPrimary);
+    expect(darkTokens.token?.colorTextSecondary).toBe(palette.textSecondary);
+  });
+});
+
+// feed.css 里那几条规则(焦点环 / 导航悬停 / 按下态 / 滚动条)只能用样式表写 —— 而样式表
+// **import 不了 TS**,所以它那一半的"同源"只能靠这里的断言守住:样式表里出现的每个 hex
+// 都必须是 palette 里的值。任何一边单独改掉一个 hex,这一组就会红(改哪个都得同时改另一边)。
+//
+// 路径用 process.cwd() 而不是 `new URL('./feed.css', import.meta.url)`:本工程跑在 jsdom 环境下,
+// 那里的 import.meta.url 不是 file: 协议(readFileSync 会当场抛 "must be of scheme file");
+// vitest 的工作目录就是工程根(`npm test` 在 frontend/ 下跑),所以 cwd + 相对路径是稳的。
+// 路径写错时 readFileSync 会直接抛错 —— 这个文件当场红,不会静默跳过。
+const FEED_CSS = readFileSync(resolve(process.cwd(), 'src/feed.css'), 'utf8');
+
+describe('feed.css 与 palette 同源', () => {
+  it('样式表里的每个 hex 都是 palette 里的值(一个都不许新造)', () => {
+    const hexes = FEED_CSS.match(/#[0-9a-fA-F]{3,8}\b/g) ?? [];
+    // 先证明"真的抓到了东西":一条都没抓到的话,下面的循环是空的,这条断言就成了摆设。
+    expect(hexes.length).toBeGreaterThan(0);
+
+    const known = new Set<string>(Object.values(palette));
+    for (const hex of hexes) {
+      expect(known.has(hex.toLowerCase())).toBe(true);
+    }
+  });
+
+  it('样式表真正用到的那两个值被钉住(焦点环 / 导航悬停底)', () => {
+    // 焦点环的亮色 = 主文字;导航悬停底 = 再亮一档的面。两条都是"改了 palette 就该跟着改"的地方,
+    // 所以这里断的是**具体哪一条规则用了它**,不只是"文件里出现过某个 hex"。
+    expect(FEED_CSS).toContain(`outline: 2px solid ${palette.textPrimary}`);
+    expect(FEED_CSS).toContain(`background: ${palette.elevated}`);
   });
 });
 

@@ -43,8 +43,8 @@ export default function LoginPage() {
       // replace:登录页不该在历史里留一格 —— 登录成功还按返回键回到登录表单是说不通的。
       router(landingPath(location.state), { replace: true });
     } catch {
-      // 拦截器已弹错
-      message.error('登录失败')
+      // 拦截器已弹错(api/axios.ts 会把后端的 msg 弹成一条 message)—— 这里不能再补一条:
+      // 同一个失败弹两条提示,用户看到的是两条互不相同的说法,而且两条叠在一起。
     } finally {
       setLoading(false);
     }

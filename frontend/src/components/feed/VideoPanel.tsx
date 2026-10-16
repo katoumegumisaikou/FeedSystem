@@ -1,16 +1,23 @@
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Typography } from 'antd';
 import { useInView } from '../../hooks/useInView';
-import { FULL_VIEWPORT_HEIGHT, SIDEBAR_WIDTH, spacing } from '../../theme/tokens';
+import {
+  FULL_VIEWPORT_HEIGHT,
+  RAIL_AVOID_WIDTH,
+  SCRIM_MIN_HEIGHT,
+  SIDEBAR_WIDTH,
+  palette,
+  spacing,
+} from '../../theme/tokens';
 import type { FeedItem } from '../../types/feed';
 
-// 深色 token 里的文字色,与 theme/tokens.ts 的 colorText / colorTextSecondary 同一个值。
-// 这里直接写死而不是从 ConfigProvider 里读:浮在视频上的字必须自己保证可读,
-// 不能依赖外层恰好套了深色 --- 一旦它落在浅色子树里,antd 会给近黑文字压在暗遮罩上,等于白写。
-const TEXT_PRIMARY = '#f5f5f7';
-const TEXT_SECONDARY = '#a1a1aa';
+// 浮在视频上的文字色取自 theme/tokens.ts 的 palette(唯一定义)——
+// 不从这个子树里的 ConfigProvider 读:浮层压的是画面,必须自己保证可读,
+// 不能依赖外层恰好套了深色(一旦它落在浅色子树里,antd 会给近黑文字压在暗遮罩上,等于白写)。
+const TEXT_PRIMARY = palette.textPrimary;
+const TEXT_SECONDARY = palette.textSecondary;
 
-// 与 ActionRail 的计数、FollowButton 的浅底按钮同一个来源(#0b0b0f):压在视频上的文字
+// 与 ActionRail 的计数、FollowButton 的浅底按钮同一个来源(palette.background):压在视频上的文字
 // 不能只赌"这一段遮罩恰好够暗"。画面亮起来时,一层与遮罩同源的暗影把笔画边缘压回可读 ——
 // 不新造颜色,与浮层里的其它文字同一套做法。
 const TEXT_SHADOW = '0 1px 2px rgba(11, 11, 15, 0.9)';
@@ -18,6 +25,22 @@ const TEXT_SHADOW = '0 1px 2px rgba(11, 11, 15, 0.9)';
 // 声音开关的触摸目标:44×44。圆形视觉只有 40px 时,手指是点不中的(与 ActionRail 的 48、
 // FeedList 的"点此重试" 44、外壳入口的 44 同一把尺子)。
 const MUTE_BUTTON_SIZE = 44;
+
+/** 播放失败的分诊:**只有这一份**。两条入口(视口驱动的那次 play、点画面重试的那次 play)
+ *  必须按同一套规矩说话 —— 原来重试那条是 `catch(() => {})`,与这里的分类自相矛盾:
+ *  同一个失败,一个静默、一个报错,取决于它是谁触发的。
+ *
+ *  为什么必须分两类:
+ *    NotAllowedError —— 自动播放策略拦下(用户还没交互),预期内,静默;
+ *    AbortError       —— 切源 / 暂停把这次 play 打断了,也预期内;
+ *    其余(NotSupportedError / 解码失败 / 源 404)说明这一屏根本播不了 ——
+ *    那时用户看到的是一张永远不动的封面,不报出来就永远查不到。 */
+function reportPlayFailure(err: unknown): void {
+  const name = err instanceof DOMException ? err.name : '';
+  if (name !== 'NotAllowedError' && name !== 'AbortError') {
+    console.error('[VideoPanel] play 失败', err);
+  }
+}
 
 /** 长文案的截断:最多 lines 行,超出给省略号。
  *
@@ -58,8 +81,10 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
     setMuted((m) => !m);
     // 这次点击是真实的用户手势:若这一屏正卡在自动播放策略上(NotAllowedError),
     // 借这个手势把它捞回来,用户就不会只看到一张永远不动的封面。
+    // 失败交给 reportPlayFailure:与下面的自动播放同一条分诊规矩(真播不了要现形),
+    // 不再写一个吞掉一切的空 catch —— 那样同一个失败在两处会有两种待遇。
     if (el?.paused) {
-      el.play()?.catch(() => {});
+      el.play()?.catch(reportPlayFailure);
     }
   };
 
@@ -73,18 +98,8 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
     if (inView) {
       // muted 默认 true,所以这里不用管"带声音自动播放会被拦"。
       // 用可选链是因为测试环境(jsdom)没实现媒体播放,根本不返回 Promise。
-      const played = el.play();
-      // 失败必须分两类,不能一律吞:
-      //   NotAllowedError —— 自动播放策略拦下(用户还没交互),预期内,静默;
-      //   AbortError       —— 切源 / 暂停把这次 play 打断了,也预期内;
-      //   其余(NotSupportedError / 解码失败 / 源 404)说明这一屏根本播不了 ——
-      //   那时用户看到的是一张永远不动的封面,不报出来就永远查不到。
-      played?.catch((err: unknown) => {
-        const name = err instanceof DOMException ? err.name : '';
-        if (name !== 'NotAllowedError' && name !== 'AbortError') {
-          console.error('[VideoPanel] play 失败', err);
-        }
-      });
+      // 失败的分诊在 reportPlayFailure 一处:它也是"点画面重试"那条入口用的同一个函数。
+      el.play()?.catch(reportPlayFailure);
     } else {
       // 挂载时也不可见 → 这里会顺手 pause 一次:没有 autoPlay 属性时它是空操作,
       // 但万一将来有人加上 autoplay、或浏览器自行恢复播放,这行才是"只有一屏出声"的保证。
@@ -110,8 +125,8 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
         ...FULL_VIEWPORT_HEIGHT,
         width: '100%',
         overflow: 'hidden',
-        // 首帧解出来之前 / 加载失败时的底色,别让画面露白
-        background: '#0b0b0f',
+        // 首帧解出来之前 / 加载失败时的底色,别让画面露白(与遮罩同源的沉浸底)
+        background: palette.background,
       }}
     >
       <video
@@ -153,6 +168,7 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           borderRadius: 999,
           border: 'none',
           cursor: 'pointer',
+          // 圆形底:沉浸底(palette.background = #0b0b0f)的 60% 透明版 —— 压在白画面上也读得清图标
           background: 'rgba(11, 11, 15, 0.6)',
           color: TEXT_PRIMARY,
           fontSize: 18,
@@ -162,7 +178,7 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
         {muted ? '🔇' : '🔊'}
       </button>
 
-      {/* 底部整条渐变遮罩:从沉浸底 #0b0b0f 渐变到透明。
+      {/* 底部整条渐变遮罩:从沉浸底(palette.background)渐变到透明。
           文字和右侧操作栏都落在这条带上,所以它是"浮层可读"的地基 —— 画面亮起来时
           白字直接压上去是读不清的。
           另外两道保险(都在下面这块文字自己身上):与遮罩同源的文字暗影,以及标题 / 描述的
@@ -175,10 +191,12 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           right: 0,
           bottom: 0,
           // 百分比高度会随视口被压扁:矮视口(手机横屏 / 矮窗口)下文字会滑到渐变很淡的那段上,
-          // 白字压亮画面实测 ≈2.9:1,低于 3:1 底线。给一个像素下限,保证文字始终落在够暗的段上。
-          height: 'max(38%, 190px)',
-          backgroundImage:
-            'linear-gradient(to top, #0b0b0f 0%, rgba(11, 11, 15, 0.72) 45%, rgba(11, 11, 15, 0) 100%)',
+          // 白字压亮画面实测 ≈2.9:1,低于 3:1 底线。给一个像素下限(值和它的理由在 tokens 里),
+          // 保证文字始终落在够暗的段上。
+          height: SCRIM_MIN_HEIGHT,
+          // 渐变从沉浸底(palette.background)到透明:暗端的 hex 不在这里再写一遍,
+          // 后面两段是同一个色的透明度变体,所以用 rgb 字面量。
+          backgroundImage: `linear-gradient(to top, ${palette.background} 0%, rgba(11, 11, 15, 0.72) 45%, rgba(11, 11, 15, 0) 100%)`,
           pointerEvents: 'none',
         }}
       />
@@ -190,11 +208,11 @@ export default function VideoPanel({ video, children }: VideoPanelProps) {
           position: 'absolute',
           left: 0,
           bottom: 0,
-          // 两侧都要避让浮层:右边是操作栏(36 * 2 + 16 = 88,按 spacing 刻度算),
+          // 两侧都要避让浮层:右边是操作栏(RAIL_AVOID_WIDTH,算式在 tokens 里),
           // 左边是 MainLayout 那条 fixed 导航(SIDEBAR_WIDTH)—— 满屏出血下它盖在视频上,
           // 不避让就把作者名压住了。写成 longhand 是为了这两处各有出处、不会互相带跑。
           paddingTop: spacing.md,
-          paddingRight: spacing.xl * 2 + spacing.md,
+          paddingRight: RAIL_AVOID_WIDTH,
           paddingBottom: spacing.xl,
           paddingLeft: SIDEBAR_WIDTH + spacing.md,
           display: 'flex',
